@@ -116,6 +116,7 @@ T_DIM = (120, 150, 120)
 T_WHITE = (235, 245, 235)
 T_MOVER = (235, 120, 215)      # motion / tiled finds — stand out from YOLO
 T_PANEL_TINT = (16, 26, 14)    # dark green-black panel fill
+_DOT_GREEN = np.array([90, 255, 120], np.float32)   # movement-dot colour (BGR)
 T_PALETTE = [(235, 210, 70), (95, 240, 140), (150, 235, 195),
              (70, 205, 245), (205, 225, 90), (130, 235, 235)]
 
@@ -348,9 +349,9 @@ def draw_zoom_pinned(frame, clean, target_box, slot, color, header,
     panel(frame, sx, sy + sh - bh, sw, bh, alpha=0.62, radius=0)
     text(frame, f"X{tcx} Y{tcy}  {mag:.1f}x", sx + S(6), sy + sh - S(5), 0.42,
          T_GREEN_DIM)
-    # tether: object  ->  box crosshair (moves with the object)
-    cv2.line(frame, (tcx, tcy), (csx, csy), T_AMBER, S(1), cv2.LINE_AA)
-    cv2.circle(frame, (tcx, tcy), S(3), T_AMBER, -1, cv2.LINE_AA)
+    # tether: object  ->  box crosshair (moves with the object) — thin
+    cv2.line(frame, (tcx, tcy), (csx, csy), T_AMBER, 1, cv2.LINE_AA)
+    cv2.circle(frame, (tcx, tcy), S(2), T_AMBER, -1, cv2.LINE_AA)
 
 
 # --------------------------------------------------------------------------- #
@@ -922,8 +923,8 @@ class TrackerApp:
         cv2.createTrackbar("Zoom motion", WINDOW, self.zoom_sens, 100,
                            lambda v: setattr(self, "zoom_sens", max(1, v)))
         cv2.setMouseCallback(WINDOW, self._on_mouse)
-        self.toasts.add("Click an object to lock on. Click SETTINGS (bottom-left) "
-                        "to enable/disable things.", 5)
+        self.toasts.add("Click an object to lock on.  + / - zoom toward the "
+                        "mouse.  Click SETTINGS (bottom-left) to toggle things.", 6)
 
         last_annotated = None
         t_prev = time.time()
@@ -1126,32 +1127,35 @@ class TrackerApp:
         self._draw_settings_panel(frame)
         return _HUD.flush(frame)
 
-    # ---- fading green movement dots ------------------------------------ #
+    # ---- small fading green movement dots ------------------------------ #
     def _draw_movement_dots(self, frame, gray):
-        """GREEN dots sampled from the actual moving pixels — so they CLUSTER
-        (and overlap) on whatever is moving rather than spreading out — fading
-        over ~10 frames. Total is capped so it never floods."""
+        """Tiny GREEN dots sampled from the actual moving pixels (they cluster on
+        the mover) that fade out by going TRANSPARENT (alpha) — staying green,
+        not darkening. Total capped so it never floods."""
         if self.prev_gray is not None and self.prev_gray.shape == gray.shape:
             thresh = clamp(int(55 - self.dot_sens * 0.5), 5, 55)  # Dots slider
             diff = cv2.absdiff(gray, self.prev_gray)
             ys, xs = np.where(diff > thresh)
             n = len(xs)
             if n:
-                # random sample → denser where there's more motion (the mover)
                 sel = np.random.choice(n, min(40, n), replace=False)
                 for i in sel:
                     self.motion_dots.append([int(xs[i]), int(ys[i]), 1.0])
-        r = S(3)
+        r = max(1, S(1))                          # SMALL dots
+        H, W = frame.shape[:2]
+        amap = np.zeros((H, W), np.float32)        # per-pixel alpha = dot life
         alive = []
         for x, y, life in self.motion_dots:
-            life -= 0.10                          # fade out
+            life -= 0.10
             if life <= 0.06:
                 continue
-            cv2.circle(frame, (x, y), r,
-                       (int(70 * life), int(255 * life), int(110 * life)),
-                       -1, cv2.LINE_AA)
+            cv2.circle(amap, (x, y), r, float(life), -1)
             alive.append([x, y, life])
-        self.motion_dots = alive[-220:]           # hard cap on total
+        self.motion_dots = alive[-220:]
+        m = amap > 0.01                            # alpha-blend green where dots are
+        if m.any():
+            a = amap[m][:, None]
+            frame[m] = (frame[m] * (1 - a) + _DOT_GREEN * a).astype(np.uint8)
 
     # ---- pinned zoom rail ---------------------------------------------- #
     def _draw_zoom_rail(self, frame, clean, items, W, H):
@@ -1348,12 +1352,20 @@ class TrackerApp:
             cv2.circle(frame, (W - S(30), S(20)), S(7), T_RED, -1, cv2.LINE_AA)
         text(frame, "REC", W - S(72), S(26), 0.6, T_RED)
 
-    # ---- keyboard (almost everything is clickable now) ----------------- #
+    # ---- keyboard (settings are clickable; these are the handy ones) ---- #
     def handle_key(self, key, frame):
-        if key in (ord("q"), 27):        # quit
+        if key in (ord("q"), 27):                    # quit
             return False
-        if key == ord(" "):              # pause
+        if key == ord(" "):                          # pause
             self.paused = not self.paused
+        elif key in (ord("="), ord("+")):            # zoom IN toward the cursor
+            mx, my = self.mouse_pos or (self._vw // 2, self._vh // 2)
+            self._zoom_at(mx, my, 1.25)
+        elif key in (ord("-"), ord("_")):            # zoom OUT toward the cursor
+            mx, my = self.mouse_pos or (self._vw // 2, self._vh // 2)
+            self._zoom_at(mx, my, 1 / 1.25)
+        elif key == ord("0"):                        # reset zoom to 1x
+            self.zoom, self.zoom_cx, self.zoom_cy = 1.0, 0.5, 0.5
         return True
 
     def _toggle_record(self, frame):
