@@ -711,6 +711,7 @@ class TrackerApp:
         self.toggles = dict(self.DEFAULT_TOGGLES)
         self.sens = clamp(int(round((0.9 - args.conf) / 0.0085)), 1, 100)
         self.dot_sens = 60          # movement-dot sensitivity (slider 1-100)
+        self.target_dots = 20       # min dots in a clump to become a target
         self.zoom_sens = 82         # zoom motion-gate sensitivity (slider 1-100)
         self.mirror = False
         self.fullscreen = False
@@ -766,12 +767,17 @@ class TrackerApp:
             if k in self.toggles:
                 self.toggles[k] = bool(v)
         self.sens = clamp(int(data.get("sens", self.sens)), 1, 100)
+        self.dot_sens = clamp(int(data.get("dot_sens", self.dot_sens)), 1, 100)
+        self.target_dots = clamp(int(data.get("target_dots",
+                                              self.target_dots)), 3, 120)
         self.mirror = bool(data.get("mirror", False))
 
     def save_settings(self):
         try:
             with open(SETTINGS_PATH, "w") as f:
                 json.dump({"toggles": self.toggles, "sens": self.sens,
+                           "dot_sens": self.dot_sens,
+                           "target_dots": self.target_dots,
                            "mirror": self.mirror}, f, indent=2)
         except OSError:
             pass
@@ -921,6 +927,8 @@ class TrackerApp:
         cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
         cv2.createTrackbar("Dots", WINDOW, self.dot_sens, 100,
                            lambda v: setattr(self, "dot_sens", max(1, v)))
+        cv2.createTrackbar("Target dots", WINDOW, self.target_dots, 120,
+                           lambda v: setattr(self, "target_dots", max(3, v)))
         cv2.setMouseCallback(WINDOW, self._on_mouse)
         self.toasts.add("+ / - zoom toward the mouse.  Click SETTINGS "
                         "(bottom-left) to toggle things.", 6)
@@ -949,6 +957,8 @@ class TrackerApp:
                 self._vw, self._vh = frame.shape[1], frame.shape[0]
                 frame = self._apply_zoom(frame)        # crop to the zoom region
                 self.dot_sens = max(1, cv2.getTrackbarPos("Dots", WINDOW))
+                self.target_dots = max(3, cv2.getTrackbarPos("Target dots",
+                                                             WINDOW))
                 annotated = self.process(frame)
                 last_annotated = annotated
                 if self._do_photo:
@@ -1084,7 +1094,7 @@ class TrackerApp:
                 groups.setdefault(lbl, []).append((x, y))
         boxes = []
         for comp in groups.values():
-            if len(comp) < 20:                     # the ">20 dots" rule
+            if len(comp) < self.target_dots:       # the "min dots" rule (slider)
                 continue
             xs = [p[0] for p in comp]
             ys = [p[1] for p in comp]
