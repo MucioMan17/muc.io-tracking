@@ -280,10 +280,10 @@ def draw_velocity(frame, center, vel, color, predict=16):
         return
     cx, cy = center
     cv2.arrowedLine(frame, (cx, cy), (int(cx + vx * 6), int(cy + vy * 6)),
-                    color, S(2), cv2.LINE_AA, tipLength=0.3)
+                    color, 1, cv2.LINE_AA, tipLength=0.3)   # thin
     px, py = int(cx + vx * predict), int(cy + vy * predict)
-    dashed_line(frame, (cx, cy), (px, py), T_AMBER, S(1))   # predicted path
-    cv2.circle(frame, (px, py), S(4), T_AMBER, S(1), cv2.LINE_AA)
+    dashed_line(frame, (cx, cy), (px, py), T_AMBER, 1)      # predicted path
+    cv2.circle(frame, (px, py), S(3), T_AMBER, 1, cv2.LINE_AA)
 
 
 def draw_label(frame, x, y, name, conf, color, track_id, moving, speed=None):
@@ -697,7 +697,7 @@ class TrackerApp:
         self.toggles = dict(self.DEFAULT_TOGGLES)
         self.sens = clamp(int(round((0.9 - args.conf) / 0.0085)), 1, 100)
         self.dot_sens = 60          # movement-dot sensitivity (slider 1-100)
-        self.zoom_sens = 70         # zoom motion-gate sensitivity (slider 1-100)
+        self.zoom_sens = 82         # zoom motion-gate sensitivity (slider 1-100)
         self.mirror = False
         self.fullscreen = False
 
@@ -857,7 +857,7 @@ class TrackerApp:
             return self.args.model
         is_gopro = (self.args.gopro
                     or str(self.args.source).lower().startswith("udp://"))
-        return "yolov8n.pt" if is_gopro else "yolov8s.pt"
+        return "yolov8s.pt"      # small detector — much better on cars than nano
 
     # ---- main loop ------------------------------------------------------ #
     def run(self):
@@ -1098,7 +1098,7 @@ class TrackerApp:
             color = tuple(int(c * 0.5) for c in base) if it["coast"] else base
             x1, y1, x2, y2 = it["box"]
             if self.toggles["boxes"]:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, S(2), cv2.LINE_AA)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
             if self.toggles["velocity"] and it["moving"] and not it["coast"]:
                 draw_velocity(frame, it["center"], it["vel"], color)
             if self.toggles["labels"]:
@@ -1402,8 +1402,9 @@ def main():
                    help="inference size. Default auto: 960 for cameras/files "
                         "(better at small/distant objects), 640 for the low-res "
                         "GoPro feed. Raise to 1280 for max range; lower for speed.")
-    p.add_argument("--conf", type=float, default=0.35,
-                   help="initial confidence threshold (sets the slider)")
+    p.add_argument("--conf", type=float, default=0.22,
+                   help="initial confidence threshold (sets the Detection "
+                        "slider). Lower catches more (e.g. fast/blurry cars).")
     p.add_argument("--width", type=int, default=1920,
                    help="requested camera capture width (default 1920)")
     p.add_argument("--height", type=int, default=1080,
