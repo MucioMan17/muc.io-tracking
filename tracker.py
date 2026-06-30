@@ -648,8 +648,9 @@ class TrackState:
         self.sconf = conf if self.sconf is None else 0.8 * self.sconf + 0.2 * conf
         return best, self.sconf
 
-    def velocity(self, k=5):
-        if len(self.trail) < k + 1:
+    def velocity(self, k=3):     # short window → registers fast movers quickly
+        k = min(k, len(self.trail) - 1)
+        if k < 1:
             return (0.0, 0.0)
         ax, ay = self.trail[-1]
         bx, by = self.trail[-1 - k]
@@ -694,6 +695,8 @@ class TrackerApp:
         self.args = args
         self.toggles = dict(self.DEFAULT_TOGGLES)
         self.sens = clamp(int(round((0.9 - args.conf) / 0.0085)), 1, 100)
+        self.dot_sens = 60          # movement-dot sensitivity (slider 1-100)
+        self.zoom_sens = 70         # zoom motion-gate sensitivity (slider 1-100)
         self.mirror = False
         self.fullscreen = False
 
@@ -701,6 +704,10 @@ class TrackerApp:
         self.toasts = Toasts()
         self.selected_id = None
         self.pending_click = None
+        self.show_settings = False  # clickable settings panel open?
+        self.hotspots = []          # [(x1,y1,x2,y2,action)] clickable regions
+        self.quit = False           # set by the Quit button
+        self._do_rec = self._do_photo = False
         self.show_help = False
         self.paused = False
         self.frame_idx = 0
@@ -755,8 +762,12 @@ class TrackerApp:
     # ---- mouse selection ------------------------------------------------ #
     def _on_mouse(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            self.pending_click = (x, y)
             self.mouse_pos = (x, y)
+            for hx1, hy1, hx2, hy2, action in self.hotspots:   # UI buttons first
+                if hx1 <= x <= hx2 and hy1 <= y <= hy2:
+                    self._click_action(action)
+                    return
+            self.pending_click = (x, y)                        # else: lock-on
         elif event == cv2.EVENT_RBUTTONDOWN:
             self._pan_last = (x, y)
         elif event == cv2.EVENT_MOUSEMOVE:
@@ -770,6 +781,31 @@ class TrackerApp:
             except Exception:
                 delta = flags
             self._zoom_at(x, y, 1.12 if delta > 0 else 1 / 1.12)
+
+    def _click_action(self, action):
+        """Dispatch a click on a settings/toolbar button."""
+        if action == "settings":
+            self.show_settings = not self.show_settings
+        elif action.startswith("toggle:"):
+            self.toggles[action.split(":", 1)[1]] ^= True
+        elif action == "rec":
+            self._do_rec = True
+        elif action == "photo":
+            self._do_photo = True
+        elif action == "zoomreset":
+            self.zoom, self.zoom_cx, self.zoom_cy = 1.0, 0.5, 0.5
+            self.toasts.add("Zoom reset")
+        elif action == "mirror":
+            self.mirror = not self.mirror
+        elif action == "fullscreen":
+            self.fullscreen = not self.fullscreen
+            cv2.setWindowProperty(
+                WINDOW, cv2.WND_PROP_FULLSCREEN,
+                cv2.WINDOW_FULLSCREEN if self.fullscreen else cv2.WINDOW_NORMAL)
+        elif action == "unlock":
+            self.selected_id = None
+        elif action == "quit":
+            self.quit = True
 
     # ---- digital zoom (crop the frame *before* detection) --------------- #
     def _zoom_at(self, vx, vy, factor):
@@ -879,10 +915,15 @@ class TrackerApp:
                   "low-res 'sub-stream' URL for smoother real-time tracking.")
 
         cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-        cv2.createTrackbar("Sensitivity", WINDOW, self.sens, 100,
+        cv2.createTrackbar("Detection", WINDOW, self.sens, 100,
                            lambda v: setattr(self, "sens", max(1, v)))
+        cv2.createTrackbar("Dots", WINDOW, self.dot_sens, 100,
+                           lambda v: setattr(self, "dot_sens", max(1, v)))
+        cv2.createTrackbar("Zoom motion", WINDOW, self.zoom_sens, 100,
+                           lambda v: setattr(self, "zoom_sens", max(1, v)))
         cv2.setMouseCallback(WINDOW, self._on_mouse)
-        self.toasts.add("Welcome — click an object to lock on. Press ? for help.", 4)
+        self.toasts.add("Click an object to lock on. Click SETTINGS (bottom-left) "
+                        "to enable/disable things.", 5)
 
         last_annotated = None
         t_prev = time.time()
@@ -907,9 +948,20 @@ class TrackerApp:
                     frame = cv2.flip(frame, 1)
                 self._vw, self._vh = frame.shape[1], frame.shape[0]
                 frame = self._apply_zoom(frame)        # crop to the zoom region
-                self.sens = max(1, cv2.getTrackbarPos("Sensitivity", WINDOW))
+                self.sens = max(1, cv2.getTrackbarPos("Detection", WINDOW))
+                self.dot_sens = max(1, cv2.getTrackbarPos("Dots", WINDOW))
+                self.zoom_sens = max(1, cv2.getTrackbarPos("Zoom motion", WINDOW))
                 annotated = self.process(model, names, frame)
                 last_annotated = annotated
+                if self._do_photo:
+                    self._do_photo = False
+                    fn = f"capture_{int(time.time())}.png"
+                    cv2.imwrite(fn, annotated)
+                    self.snaps += 1
+                    self.toasts.add(f"Saved {fn}")
+                if self._do_rec:
+                    self._do_rec = False
+                    self._toggle_record(annotated)
                 if self.writer is not None:
                     self.writer.write(annotated)
             else:
@@ -930,7 +982,7 @@ class TrackerApp:
 
             cv2.imshow(WINDOW, annotated)
             key = cv2.waitKey(1) & 0xFF
-            if not self.handle_key(key, annotated):
+            if self.quit or not self.handle_key(key, annotated):
                 break
             if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
                 break
@@ -948,6 +1000,9 @@ class TrackerApp:
         H, W = frame.shape[:2]
         set_ui_scale(H)                  # scale all UI to the frame resolution
         diag = math.hypot(H, W)
+        # Zoom-motion slider → how little movement counts as "moving" (gates the
+        # zoom boxes). Higher slider = more sensitive = catches fast/slow cars.
+        move_thresh = diag * (0.011 - self.zoom_sens * 0.0001)
         clean = frame.copy()
         res = model.track(frame, persist=True, conf=self.conf, iou=0.5,
                           imgsz=self.args.imgsz, device=self.device,
@@ -964,7 +1019,7 @@ class TrackerApp:
                 "id": tid, "name": name, "conf": conf, "box": (x1, y1, x2, y2),
                 "center": ((x1 + x2) // 2, (y1 + y2) // 2), "poly": poly,
                 "area": (x2 - x1) * (y2 - y1), "vel": (vx, vy), "speed": spd,
-                "moving": spd > diag * 0.004, "coast": coast,
+                "moving": spd > move_thresh, "coast": coast,
             }
 
         items = []
@@ -1062,13 +1117,13 @@ class TrackerApp:
             text(frame, f"// ACQUIRING T{self.selected_id:02d} ...", 14, H - 74,
                  0.5, T_AMBER)
 
+        self.hotspots = []           # rebuilt by the toolbar + settings panel
         self._draw_hud(frame, shown)
         self._draw_zoom_minimap(frame)
         if self.writer is not None:
             self._draw_rec_badge(frame)
         self.toasts.draw(frame)
-        if self.show_help:
-            self._draw_help(frame)
+        self._draw_settings_panel(frame)
         return _HUD.flush(frame)
 
     # ---- fading green movement dots ------------------------------------ #
@@ -1077,8 +1132,9 @@ class TrackerApp:
         (and overlap) on whatever is moving rather than spreading out — fading
         over ~10 frames. Total is capped so it never floods."""
         if self.prev_gray is not None and self.prev_gray.shape == gray.shape:
+            thresh = clamp(int(55 - self.dot_sens * 0.5), 5, 55)  # Dots slider
             diff = cv2.absdiff(gray, self.prev_gray)
-            ys, xs = np.where(diff > 25)
+            ys, xs = np.where(diff > thresh)
             n = len(xs)
             if n:
                 # random sample → denser where there's more motion (the mover)
@@ -1211,23 +1267,62 @@ class TrackerApp:
         self._draw_toolbar(frame)
 
     def _draw_toolbar(self, frame):
+        """Clickable bottom toolbar of action buttons (registers hotspots)."""
         H, W = frame.shape[:2]
-        bh = _mono_size(0.5) + S(14)
-        panel(frame, 0, H - bh, W, bh, alpha=0.55, radius=0)
+        bh = _mono_size(0.5) + S(18)
+        panel(frame, 0, H - bh, W, bh, alpha=0.6, radius=0)
         cv2.line(frame, (0, H - bh), (W, H - bh), T_GREEN, S(1), cv2.LINE_AA)
-        segs = [("0", f"ZOOM {self.zoom:.1f}x", self.zoom > 1.001),
-                ("D", "DOTS", self.toggles["dots"]),
-                ("B", "BOX", self.toggles["boxes"]),
-                ("L", "LABEL", self.toggles["labels"]),
-                ("V", "PREDICT", self.toggles["velocity"]),
-                ("Z", "ZOOMBOX", self.toggles["zoom"]),
-                ("R", "REC", self.writer is not None),
-                ("?", "HELP", self.show_help)]
-        x = S(12)
-        for k, lab, active in segs:
-            s = f"[{k}]{lab}"
-            text(frame, s, x, H - S(9), 0.5, T_AMBER if active else T_GREEN_DIM)
-            x += mono_w(s, 0.5) + S(16)
+        btns = [("settings", "SETTINGS", self.show_settings),
+                ("rec", "REC", self.writer is not None),
+                ("photo", "PHOTO", False),
+                ("zoomreset", f"ZOOM {self.zoom:.1f}x", self.zoom > 1.001),
+                ("quit", "QUIT", False)]
+        x = S(10)
+        y1, y2 = H - bh + S(4), H - S(4)
+        for action, lab, active in btns:
+            w = mono_w(lab, 0.5) + S(16)
+            col = T_AMBER if active else T_GREEN
+            cv2.rectangle(frame, (x, y1), (x + w, y2), col, S(1), cv2.LINE_AA)
+            text(frame, lab, x + S(8), y2 - S(6), 0.5, col)
+            self.hotspots.append((x, y1, x + w, y2, action))
+            x += w + S(10)
+
+    def _draw_settings_panel(self, frame):
+        """Click-to-toggle settings panel (replaces the old keybinds)."""
+        if not self.show_settings:
+            return
+        H, W = frame.shape[:2]
+        rows = [(f"toggle:{k}", lab, self.toggles[k]) for k, lab in (
+                ("dots", "Movement dots"), ("boxes", "Object boxes"),
+                ("labels", "Labels"), ("velocity", "Prediction arrows"),
+                ("zoom", "Zoom boxes (movers)"))]
+        rows += [("mirror", "Mirror image", self.mirror),
+                 ("fullscreen", "Fullscreen", self.fullscreen),
+                 ("unlock", "Clear lock", self.selected_id is not None)]
+        rh = lh(0.55)
+        pw = S(330)
+        ph = S(40) + len(rows) * rh + S(14)
+        px, py = S(8), S(118)
+        panel(frame, px, py, pw, ph, alpha=0.86, radius=S(8), border=T_GREEN)
+        text(frame, "SETTINGS  ( click a row )", px + S(16), py + S(28),
+             0.58, T_GREEN)
+        y = py + S(46)
+        for action, label, on in rows:
+            r1, r2 = y, y + rh
+            self.hotspots.append((px + S(6), r1, px + pw - S(6), r2, action))
+            # checkbox
+            bx, bsz = px + S(16), S(16)
+            by = r1 + (rh - bsz) // 2
+            cv2.rectangle(frame, (bx, by), (bx + bsz, by + bsz),
+                          T_GREEN if on else T_DIM, S(1), cv2.LINE_AA)
+            if on:
+                cv2.rectangle(frame, (bx + S(3), by + S(3)),
+                              (bx + bsz - S(3), by + bsz - S(3)), T_GREEN, -1)
+            text(frame, label, bx + S(26), r2 - S(7), 0.5,
+                 T_WHITE if on else T_GREEN_DIM)
+            text(frame, "ON" if on else "OFF", px + pw - S(50), r2 - S(7), 0.48,
+                 T_GREEN if on else T_DIM)
+            y += rh
 
     def _draw_zoom_minimap(self, frame):
         """When zoomed, a little map showing which part of the full frame the
@@ -1253,71 +1348,12 @@ class TrackerApp:
             cv2.circle(frame, (W - S(30), S(20)), S(7), T_RED, -1, cv2.LINE_AA)
         text(frame, "REC", W - S(72), S(26), 0.6, T_RED)
 
-    def _draw_help(self, frame):
-        H, W = frame.shape[:2]
-        row = lh(0.5)
-        pw, ph = S(470), row * len(KEYHELP) + S(56)
-        x, y = (W - pw) // 2, (H - ph) // 2
-        panel(frame, x, y, pw, ph, alpha=0.82, radius=S(10), border=T_GREEN)
-        text(frame, "// TACTICAL CONTROLS", x + S(22), y + S(34), 0.62, T_GREEN)
-        for i, (k, d) in enumerate(KEYHELP):
-            yy = y + S(58) + i * row
-            text(frame, k, x + S(26), yy, 0.5, T_AMBER)
-            text(frame, d.upper(), x + S(160), yy, 0.48, T_GREEN_DIM)
-
-    # ---- keyboard ------------------------------------------------------- #
+    # ---- keyboard (almost everything is clickable now) ----------------- #
     def handle_key(self, key, frame):
-        if key == 255:
-            return True
-        if key in (ord("q"), 27):
+        if key in (ord("q"), 27):        # quit
             return False
-        elif key == ord(" "):
+        if key == ord(" "):              # pause
             self.paused = not self.paused
-        elif key == ord("d"):
-            self.toggles["dots"] ^= True
-        elif key == ord("z"):
-            self.toggles["zoom"] ^= True
-        elif key == ord("l"):
-            self.toggles["labels"] ^= True
-        elif key == ord("b"):
-            self.toggles["boxes"] ^= True
-        elif key == ord("v"):
-            self.toggles["velocity"] ^= True
-        elif key == ord("e"):
-            self.mirror = not self.mirror
-            self.toasts.add(f"Mirror {'on' if self.mirror else 'off'}")
-        elif key == ord("f"):
-            self.fullscreen = not self.fullscreen
-            cv2.setWindowProperty(
-                WINDOW, cv2.WND_PROP_FULLSCREEN,
-                cv2.WINDOW_FULLSCREEN if self.fullscreen else cv2.WINDOW_NORMAL)
-        elif key == ord("x"):
-            self.selected_id = None
-            self.toasts.add("Lock cleared")
-        elif key in (ord("="), ord("+")):
-            mx, my = self.mouse_pos or (self._vw // 2, self._vh // 2)
-            self._zoom_at(mx, my, 1.2)
-        elif key in (ord("-"), ord("_")):
-            mx, my = self.mouse_pos or (self._vw // 2, self._vh // 2)
-            self._zoom_at(mx, my, 1 / 1.2)
-        elif key == ord("0"):
-            self.zoom, self.zoom_cx, self.zoom_cy = 1.0, 0.5, 0.5
-            self.toasts.add("Zoom reset (1x)")
-        elif key in (ord("?"), ord("/")):
-            self.show_help = not self.show_help
-        elif key == ord("r"):
-            self._toggle_record(frame)
-        elif key == ord("["):
-            self.sens = clamp(self.sens - 5, 1, 100)
-            cv2.setTrackbarPos("Sensitivity", WINDOW, self.sens)
-        elif key == ord("]"):
-            self.sens = clamp(self.sens + 5, 1, 100)
-            cv2.setTrackbarPos("Sensitivity", WINDOW, self.sens)
-        elif key == ord("p"):
-            fn = f"capture_{int(time.time())}.png"
-            cv2.imwrite(fn, frame)
-            self.snaps += 1
-            self.toasts.add(f"Saved {fn}")
         return True
 
     def _toggle_record(self, frame):
