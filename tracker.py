@@ -857,7 +857,10 @@ class TrackerApp:
             return self.args.model
         is_gopro = (self.args.gopro
                     or str(self.args.source).lower().startswith("udp://"))
-        return "yolov8s.pt"      # small detector — much better on cars than nano
+        return "yolov8m.pt"      # best balance: strong AND fast enough (~15fps)
+        #                          to actually catch fast movers between frames.
+        #                          --model yolov8l.pt / yolov8x.pt = more accurate
+        #                          per frame but lower fps (can MISS fast cars).
 
     # ---- main loop ------------------------------------------------------ #
     def run(self):
@@ -870,7 +873,7 @@ class TrackerApp:
                     or str(self.args.source).lower().startswith("udp://"))
         self.model_name = self._resolve_model_name()
         if self.args.imgsz is None:              # bigger = better at small/far
-            self.args.imgsz = 640 if is_gopro else 960
+            self.args.imgsz = 960 if is_gopro else 1280
         if self.args.model == "auto":
             print(f"Auto-selected model: {self.model_name} @ imgsz "
                   f"{self.args.imgsz}")
@@ -1402,7 +1405,7 @@ def main():
                    help="inference size. Default auto: 960 for cameras/files "
                         "(better at small/distant objects), 640 for the low-res "
                         "GoPro feed. Raise to 1280 for max range; lower for speed.")
-    p.add_argument("--conf", type=float, default=0.22,
+    p.add_argument("--conf", type=float, default=0.18,
                    help="initial confidence threshold (sets the Detection "
                         "slider). Lower catches more (e.g. fast/blurry cars).")
     p.add_argument("--width", type=int, default=1920,
