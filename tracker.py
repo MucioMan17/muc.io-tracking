@@ -631,12 +631,17 @@ class TrackState:
         self.sconf = None       # EMA-smoothed confidence
 
     def update_box(self, box, alpha=0.4):
-        """Exponentially smooth the box so brackets/labels don't jitter."""
+        """Smooth the box to kill jitter — but ADAPTIVELY: when the box jumps a
+        lot (a fast mover) snap almost fully to it, so the box rides ON the
+        object instead of lagging behind it. Slow/static objects stay smoothed."""
         if self.sbox is None:
             self.sbox = list(map(float, box))
         else:
+            move = sum(abs(box[i] - self.sbox[i]) for i in range(4))
+            w = max(1.0, self.sbox[2] - self.sbox[0])
+            a = clamp(alpha + (move / w) * 1.5, alpha, 0.92)   # big jump → snap
             for i in range(4):
-                self.sbox[i] = (1 - alpha) * self.sbox[i] + alpha * box[i]
+                self.sbox[i] = (1 - a) * self.sbox[i] + a * box[i]
         return tuple(int(round(v)) for v in self.sbox)
 
     def smoothed(self):
@@ -872,8 +877,8 @@ class TrackerApp:
         is_gopro = (self.args.gopro
                     or str(self.args.source).lower().startswith("udp://"))
         self.model_name = self._resolve_model_name()
-        if self.args.imgsz is None:              # bigger = better at small/far
-            self.args.imgsz = 960 if is_gopro else 1280
+        if self.args.imgsz is None:              # keep it real-time (fps matters
+            self.args.imgsz = 640 if is_gopro else 960   # for tracking fast cars)
         if self.args.model == "auto":
             print(f"Auto-selected model: {self.model_name} @ imgsz "
                   f"{self.args.imgsz}")
