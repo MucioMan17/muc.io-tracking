@@ -79,15 +79,6 @@ def cam_backend():
     return cv2.CAP_AVFOUNDATION
 
 
-def iou_xyxy(a, b):
-    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
-    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
-    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
-    inter = iw * ih
-    ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
-    return inter / ua if ua > 0 else 0.0
-
-
 def pick_device(requested: str) -> str:
     import torch
     if requested and requested != "auto":
@@ -113,16 +104,8 @@ def list_cameras(max_idx: int = 8):
     return found
 
 
-def gaussian_patch(size=61, sigma=13):
-    ax = np.arange(size) - size // 2
-    xx, yy = np.meshgrid(ax, ax)
-    return np.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2)).astype(np.float32)
-
-
 # --------------------------------------------------------------------------- #
-# Tactical visual theme — phosphor green / cyan / amber palette, monospace text,
-# bracket targets, crosshair reticles, magnifier insets and a radar sweep.
-# (Our own take on the "SIGINT terminal" look — not a copy of any one app.)
+# Visual theme — phosphor green / cyan / amber palette, crisp monospace text.
 # --------------------------------------------------------------------------- #
 T_CYAN = (235, 210, 70)        # BGR — primary target colour
 T_GREEN = (95, 240, 140)       # phosphor green — telemetry text
@@ -288,43 +271,6 @@ def draw_reticle(frame, center, color, r=None, gap=None):
     for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
         cv2.line(frame, (cx + dx * (r + gap + S(5)), cy + dy * (r + gap + S(5))),
                  (cx + dx * (r + gap), cy + dy * (r + gap)), color, S(1), cv2.LINE_AA)
-
-
-def draw_radar(frame, phase):
-    """Faint rotating radar sweep centred on the frame — pure ambience."""
-    H, W = frame.shape[:2]
-    cx, cy = W // 2, H // 2
-    R = int(min(H, W) * 0.42)
-    ov = frame.copy()
-    for rr in (R, int(R * 0.66), int(R * 0.33)):
-        cv2.circle(ov, (cx, cy), rr, T_CYAN, 1, cv2.LINE_AA)
-    cv2.line(ov, (cx - R, cy), (cx + R, cy), T_CYAN, 1, cv2.LINE_AA)
-    cv2.line(ov, (cx, cy - R), (cx, cy + R), T_CYAN, 1, cv2.LINE_AA)
-    ang = phase * 0.6
-    wedge = [(cx, cy)]
-    for a in np.linspace(ang - 0.45, ang, 14):
-        wedge.append((int(cx + math.cos(a) * R), int(cy + math.sin(a) * R)))
-    cv2.fillPoly(ov, [np.array(wedge, np.int32)], T_CYAN)
-    cv2.line(ov, (cx, cy), (int(cx + math.cos(ang) * R),
-                            int(cy + math.sin(ang) * R)), T_GREEN, 2, cv2.LINE_AA)
-    cv2.addWeighted(ov, 0.20, frame, 0.80, 0, frame)
-
-
-def draw_movement_dots(frame, prev_gray, gray, color, step=7, thresh=20):
-    """Scatter dots wherever the image actually moved since the last frame —
-    a live 'this is where motion is happening' field (capped for performance)."""
-    if prev_gray is None or prev_gray.shape != gray.shape:
-        return
-    sub = cv2.absdiff(gray[::step, ::step], prev_gray[::step, ::step])
-    ys, xs = np.where(sub > thresh)
-    n = len(xs)
-    if n == 0:
-        return
-    skip = max(1, n // 1500)
-    r = S(2)
-    for k in range(0, n, skip):
-        cv2.circle(frame, (int(xs[k]) * step, int(ys[k]) * step), r,
-                   color, -1, cv2.LINE_AA)
 
 
 def draw_velocity(frame, center, vel, color, predict=16):
@@ -710,52 +656,6 @@ class TrackState:
         return ((ax - bx) / k, (ay - by) / k)
 
 
-class SuppTracker:
-    """Lightweight IoU tracker for 'supplementary' detections (motion blobs and
-    tiled finds) that don't come from YOLO's own tracker. Gives them stable ids,
-    EMA-smoothed boxes, trails and cached labels — so tiny far-away movers get
-    the same treatment (boxes, tethers, zoom) as normal detections."""
-
-    def __init__(self):
-        self.tracks = {}
-        self.nid = 100000           # id space well clear of YOLO track ids
-
-    def update(self, dets, frame_idx):
-        """dets: list of (box_xyxy, cls or None, conf). Returns id -> track."""
-        free = set(self.tracks)
-        out = {}
-        for box, cls, conf in dets:
-            best, bid = 0.2, None
-            for tid in free:
-                v = iou_xyxy(box, self.tracks[tid]["box"])
-                if v > best:
-                    best, bid = v, tid
-            if bid is None:
-                self.nid += 1
-                bid = self.nid
-                self.tracks[bid] = {"box": list(map(float, box)),
-                                    "trail": deque(maxlen=32), "cls": cls,
-                                    "conf": conf or 0.5, "labelled": -999,
-                                    "last": frame_idx, "seen": 0}
-            else:
-                free.discard(bid)
-                t = self.tracks[bid]
-                for i in range(4):
-                    t["box"][i] = 0.6 * t["box"][i] + 0.4 * box[i]
-                if cls is not None:
-                    t["cls"], t["conf"] = cls, conf
-            t = self.tracks[bid]
-            t["last"] = frame_idx
-            t["seen"] += 1
-            cx = int((t["box"][0] + t["box"][2]) / 2)
-            cy = int((t["box"][1] + t["box"][3]) / 2)
-            t["trail"].append((cx, cy))
-            out[bid] = t
-        for tid in [k for k, v in self.tracks.items() if frame_idx - v["last"] > 12]:
-            del self.tracks[tid]
-        return out
-
-
 class Toasts:
     """Transient on-screen notifications."""
     def __init__(self):
@@ -821,6 +721,7 @@ class TrackerApp:
         self.zoom_slots = {}        # track id -> fixed rail slot index (stable)
         self.zoom_hold = {}         # track id -> last frame it was "moving"
         self.prev_gray = None       # previous frame (grayscale) for movement dots
+        self.motion_dots = {}       # (gx,gy) -> life, fading green movement dots
         self.model_name = ""
 
         self.load_settings()
@@ -927,10 +828,15 @@ class TrackerApp:
 
         self.device = pick_device(self.args.device)
 
-        # auto-pick the model to suit the source (see _resolve_model_name)
+        # auto-pick the model + inference size to suit the source
+        is_gopro = (self.args.gopro
+                    or str(self.args.source).lower().startswith("udp://"))
         self.model_name = self._resolve_model_name()
+        if self.args.imgsz is None:              # bigger = better at small/far
+            self.args.imgsz = 640 if is_gopro else 960
         if self.args.model == "auto":
-            print(f"Auto-selected model: {self.model_name}")
+            print(f"Auto-selected model: {self.model_name} @ imgsz "
+                  f"{self.args.imgsz}")
 
         print("Loading model…", flush=True)
         model = YOLO(self.model_name)
@@ -1120,13 +1026,14 @@ class TrackerApp:
             self.selected_id = hit["id"] if hit else None
             self.toasts.add(f"Locked on {hit['name']}" if hit else "Lock cleared")
 
-        # --- movement dots: dots wherever the scene actually moved this frame ---
+        # --- fading green movement dots ---
         if self.toggles["dots"]:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            draw_movement_dots(frame, self.prev_gray, gray, T_CYAN)
+            self._draw_movement_dots(frame, gray)
             self.prev_gray = gray
         else:
             self.prev_gray = None
+            self.motion_dots.clear()
 
         items.sort(key=lambda d: d["area"], reverse=True)
         shown = Counter()
@@ -1164,149 +1071,38 @@ class TrackerApp:
             self._draw_help(frame)
         return _HUD.flush(frame)
 
-    # ---- heatmap -------------------------------------------------------- #
-    def _stamp_heat(self, cx, cy):
-        b = self.blob
-        ph = b.shape[0] // 2
-        H, W = self.heat.shape
-        y0, y1 = cy - ph, cy + ph + 1
-        x0, x1 = cx - ph, cx + ph + 1
-        by0, bx0 = max(0, -y0), max(0, -x0)
-        y0, x0 = max(0, y0), max(0, x0)
-        y1, x1 = min(H, y1), min(W, x1)
-        if y1 <= y0 or x1 <= x0:
-            return
-        self.heat[y0:y1, x0:x1] += b[by0:by0 + (y1 - y0), bx0:bx0 + (x1 - x0)]
-
-    def _draw_heatmap(self, frame):
-        mx = float(self.heat.max())
-        if mx < 1e-3:
-            return
-        norm = np.clip(self.heat / mx, 0, 1)
-        hm = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
-        m = norm > 0.06
-        frame[m] = (frame[m] * 0.45 + hm[m] * 0.55).astype(np.uint8)
-
-    # ---- motion + tiled small-object detection ------------------------- #
-    def _motion_boxes(self, frame):
-        """Background-subtraction blobs — finds tiny moving things YOLO can't
-        even see (best with a still/tripod camera)."""
-        if self.bgsub is None:
-            self.bgsub = cv2.createBackgroundSubtractorMOG2(
-                history=400, varThreshold=60, detectShadows=False)
-        H, W = frame.shape[:2]
-        fg = self.bgsub.apply(frame)
-        fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)[1]
-        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        fg = cv2.dilate(fg, np.ones((5, 5), np.uint8), iterations=2)
-        cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        area = W * H
-        out = []
-        for c in cnts:
-            a = cv2.contourArea(c)
-            if a < area * 0.0006 or a > area * 0.25:    # ignore noise & pans
+    # ---- fading green movement dots ------------------------------------ #
+    def _draw_movement_dots(self, frame, gray):
+        """A sparse field of GREEN dots wherever the image moved, that fade out
+        over ~10 frames — so movers leave a short comet-trail, not a flood."""
+        H, W = gray.shape
+        step = max(14, W // 46)                  # spacing → keeps it sparse
+        if self.prev_gray is not None and self.prev_gray.shape == gray.shape:
+            diff = cv2.absdiff(gray[::step, ::step], self.prev_gray[::step, ::step])
+            ys, xs = np.where(diff > 28)
+            pts = list(zip(xs.tolist(), ys.tolist()))
+            if len(pts) > 45:                    # cap new dots per frame
+                pick = np.linspace(0, len(pts) - 1, 45).astype(int)
+                pts = [pts[i] for i in pick]
+            for gx, gy in pts:
+                self.motion_dots[(gx, gy)] = 1.0
+        r = S(2)
+        dead = []
+        for key, life in self.motion_dots.items():
+            life -= 0.10                         # fade out
+            if life <= 0.05:
+                dead.append(key)
                 continue
-            x, y, w, h = cv2.boundingRect(c)
-            out.append(((x, y, x + w, y + h), None, 0.5))
-        return out
-
-    def _tile_dets(self, frame, model):
-        """Run YOLO on an NxN grid of overlapping tiles so small objects are
-        effectively magnified for the detector. Heavy — best on a strong GPU."""
-        H, W = frame.shape[:2]
-        n = self.args.tiles
-        tw, th = W / n, H / n
-        out = []
-        for r in range(n):
-            for c in range(n):
-                x1 = int(max(0, c * tw - 0.15 * tw))
-                y1 = int(max(0, r * th - 0.15 * th))
-                x2 = int(min(W, (c + 1) * tw + 0.15 * tw))
-                y2 = int(min(H, (r + 1) * th + 0.15 * th))
-                tile = frame[y1:y2, x1:x2]
-                try:
-                    res = model.predict(tile, imgsz=self.args.imgsz,
-                                        conf=self.conf, verbose=False)[0]
-                except Exception:
-                    continue
-                if res.boxes is None:
-                    continue
-                xy = res.boxes.xyxy.cpu().numpy()
-                cl = res.boxes.cls.int().cpu().tolist()
-                cf = res.boxes.conf.cpu().tolist()
-                for i in range(len(cl)):
-                    bx1, by1, bx2, by2 = xy[i]
-                    out.append(((int(bx1 + x1), int(by1 + y1),
-                                 int(bx2 + x1), int(by2 + y1)), cl[i], cf[i]))
-        return out
-
-    def _classify_crop(self, clean, box, model):
-        """Crop around a region and run YOLO on it (zoomed) to label a mover."""
-        H, W = clean.shape[:2]
-        x1, y1, x2, y2 = box
-        pw, ph = (x2 - x1) * 0.5 + 8, (y2 - y1) * 0.5 + 8
-        cx1, cy1 = clamp(int(x1 - pw), 0, W - 1), clamp(int(y1 - ph), 0, H - 1)
-        cx2, cy2 = clamp(int(x2 + pw), 1, W), clamp(int(y2 + ph), 1, H)
-        crop = clean[cy1:cy2, cx1:cx2]
-        if crop.size == 0:
-            return None, 0.0
-        try:
-            r = model.predict(crop, imgsz=256, conf=0.3, verbose=False)[0]
-        except Exception:
-            return None, 0.0
-        if r.boxes is not None and len(r.boxes):
-            i = int(r.boxes.conf.argmax())
-            return int(r.boxes.cls[i]), float(r.boxes.conf[i])
-        return None, 0.0
-
-    def _supplementary_items(self, frame, clean, model, names, main_items, diag):
-        cands = []
-        if self.toggles["motion"]:
-            cands += self._motion_boxes(frame)
-        if self.args.tiles > 1:
-            cands += self._tile_dets(frame, model)
-        # only keep finds the main pass missed (drop any blob whose centre
-        # sits inside an already-detected object -> kills the pile-on flood)
-        mboxes = [it["box"] for it in main_items]
-
-        def _covered(b):
-            bx, by = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
-            return any((mb[0] <= bx <= mb[2] and mb[1] <= by <= mb[3])
-                       or iou_xyxy(b, mb) > 0.2 for mb in mboxes)
-        cands = [(b, cl, cf) for (b, cl, cf) in cands if not _covered(b)]
-        if not cands:
-            return []
-        self.supp.update([(b, cl, cf) for (b, cl, cf) in cands], self.frame_idx)
-        # only movers that have persisted a few frames (filters sensor noise),
-        # coasted briefly so they don't flicker, and capped to the biggest few
-        steady = [(tid, t) for tid, t in self.supp.tracks.items()
-                  if t["seen"] >= 4 and self.frame_idx - t["last"] <= 3]
-        steady.sort(key=lambda kt: -(kt[1]["box"][2] - kt[1]["box"][0])
-                    * (kt[1]["box"][3] - kt[1]["box"][1]))
-        items = []
-        for tid, t in steady[:8]:
-            if t["cls"] is None and self.frame_idx - t["labelled"] > 12:
-                cls, conf = self._classify_crop(clean, t["box"], model)
-                if cls is not None:
-                    t["cls"], t["conf"] = cls, conf
-                t["labelled"] = self.frame_idx
-            x1, y1, x2, y2 = map(int, t["box"])
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            tr = t["trail"]
-            if len(tr) >= 6:
-                vx, vy = (tr[-1][0] - tr[-6][0]) / 5, (tr[-1][1] - tr[-6][1]) / 5
-            else:
-                vx = vy = 0.0
-            name = (names.get(t["cls"], "mover")
-                    if t["cls"] is not None and t["conf"] >= 0.5 else "mover")
-            items.append({
-                "id": tid, "name": name, "conf": t["conf"],
-                "box": (x1, y1, x2, y2), "center": (cx, cy), "poly": None,
-                "area": (x2 - x1) * (y2 - y1), "vel": (vx, vy),
-                "speed": math.hypot(vx, vy), "moving": True, "coast": False,
-                "trail": list(tr), "supp": True,
-            })
-        return items
+            self.motion_dots[key] = life
+            gx, gy = key
+            col = (int(70 * life), int(255 * life), int(120 * life))   # green BGR
+            cv2.circle(frame, (gx * step, gy * step), r, col, -1, cv2.LINE_AA)
+        for k in dead:
+            del self.motion_dots[k]
+        if len(self.motion_dots) > 200:          # hard cap, drop the faintest
+            for k in sorted(self.motion_dots, key=self.motion_dots.get)[
+                    :len(self.motion_dots) - 200]:
+                del self.motion_dots[k]
 
     # ---- pinned zoom rail ---------------------------------------------- #
     def _draw_zoom_rail(self, frame, clean, items, W, H):
@@ -1440,25 +1236,6 @@ class TrackerApp:
             text(frame, s, x, H - S(9), 0.5, T_AMBER if active else T_GREEN_DIM)
             x += mono_w(s, 0.5) + S(16)
 
-    def _draw_stats(self, frame):
-        H, W = frame.shape[:2]
-        rows = sorted(self.seen.items(), key=lambda kv: -len(kv[1]))[:10]
-        total = sum(len(v) for v in self.seen.values())
-        lines = [("// SESSION INTEL", T_GREEN)]
-        lines.append((f"UNIQUE CONTACTS {total:03d}", T_GREEN_DIM))
-        lines += [(f"{len(v):3d}  {k.upper()}", T_CYAN) for k, v in rows]
-        if not rows:
-            lines.append(("(no contacts yet)", T_DIM))
-        row = lh(0.5)
-        pw = max(mono_w(s, 0.5) for s, _ in lines) + S(28)
-        ph = row * len(lines) + S(16)
-        x = W - pw - S(12)
-        y = (S(10) + S(176) + S(28) + S(214) + S(14)) if self.selected_id is not None \
-            else (S(8) + lh(0.5) * 6 + S(30))
-        panel(frame, x, y, pw, ph, alpha=0.6, radius=S(6), border=T_GREEN)
-        for i, (s, c) in enumerate(lines):
-            text(frame, s, x + S(14), y + S(24) + i * row, 0.5, c)
-
     def _draw_zoom_minimap(self, frame):
         """When zoomed, a little map showing which part of the full frame the
         view (and the detector) is currently looking at."""
@@ -1577,20 +1354,13 @@ def main():
     p.add_argument("--gopro-ip", default=GOPRO_DEFAULT_IP,
                    help=f"GoPro IP on its WiFi (default {GOPRO_DEFAULT_IP})")
     p.add_argument("--model", default="auto",
-                   help="YOLO model, or 'auto' (default): picks yolov8n-seg for "
-                        "low-res GoPro feeds (speed) and yolov8s-seg for "
-                        "cameras/files (accuracy). Or set one explicitly, e.g. "
-                        "yolov8m-seg.pt.")
-    p.add_argument("--imgsz", type=int, default=640,
-                   help="inference size; raise to find smaller/distant objects "
-                        "(e.g. 1280, 1536), lower it for speed (e.g. 512). "
-                        "Bigger = better small-object detection but slower.")
-    p.add_argument("--tiles", type=int, default=1,
-                   help="run detection on an NxN grid of tiles (e.g. 2 = 4 tiles) "
-                        "to catch small/distant objects. Heavy — for strong GPUs.")
-    p.add_argument("--motion", action="store_true",
-                   help="start with the motion-detection layer on (catches tiny "
-                        "movers; best with a still camera). Toggle live with N.")
+                   help="YOLO detection model, or 'auto' (default): yolov8n for "
+                        "low-res GoPro (speed), yolov8s for cameras/files "
+                        "(accuracy). Or set one, e.g. yolov8m.pt for more range.")
+    p.add_argument("--imgsz", type=int, default=None,
+                   help="inference size. Default auto: 960 for cameras/files "
+                        "(better at small/distant objects), 640 for the low-res "
+                        "GoPro feed. Raise to 1280 for max range; lower for speed.")
     p.add_argument("--conf", type=float, default=0.35,
                    help="initial confidence threshold (sets the slider)")
     p.add_argument("--width", type=int, default=1920,
