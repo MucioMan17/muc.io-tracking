@@ -1,0 +1,10 @@
+# Real-time object tracker dependencies
+# (torch is pulled in automatically by ultralytics; on Apple Silicon the
+#  default wheel includes the MPS / Metal GPU backend.)
+ultralytics>=8.3.0
+opencv-python>=4.10.0
+numpy>=1.26.0
+# linear-assignment solver required by ByteTrack (provides the `lap` module)
+lapx>=0.5.11
+# bundles a static ffmpeg binary used for robust GoPro/UDP stream decoding
+imageio-ffmpeg>=0.5.1

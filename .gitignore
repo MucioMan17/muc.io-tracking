@@ -1,0 +1,18 @@
+# Python environment (recreated by setup on each machine)
+.venv/
+__pycache__/
+*.pyc
+
+# Model weights — auto-downloaded by setup, don't bloat the repo
+*.pt
+
+# Per-machine / generated output
+settings.json
+capture_*.png
+recording_*.mp4
+detector/dataset/
+detector/result.png
+detector/detect_out.png
+
+# OS junk
+.DS_Store
