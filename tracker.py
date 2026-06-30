@@ -555,8 +555,9 @@ class FFmpegStream:
     def _cmd(self):
         url = self.url
         if url.lower().startswith("udp://") and "?" not in url:
-            # big OS receive buffer + tolerate overruns => far less packet loss
-            url += "?overrun_nonfatal=1&fifo_size=5000000&buffer_size=2000000"
+            # SMALL buffers + drop-on-overrun => stay near-live (don't queue a
+            # backlog) when the detector can't keep up with the camera's fps
+            url += "?overrun_nonfatal=1&fifo_size=2000&buffer_size=500000"
         vf = (f"scale={self.w}:{self.h}:force_original_aspect_ratio=decrease,"
               f"pad={self.w}:{self.h}:(ow-iw)/2:(oh-ih)/2")
         return [self._ffmpeg_exe(), "-hide_banner", "-loglevel", "fatal",
@@ -569,8 +570,9 @@ class FFmpegStream:
 
     def _spawn(self):
         try:
+            # tiny pipe buffer so Python never holds a backlog of stale frames
             self.proc = subprocess.Popen(self._cmd(), stdout=subprocess.PIPE,
-                                         stderr=subprocess.DEVNULL, bufsize=10 ** 8)
+                                         stderr=subprocess.DEVNULL, bufsize=65536)
             return True
         except (OSError, ValueError):
             return False
