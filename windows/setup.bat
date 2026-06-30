@@ -41,7 +41,7 @@ if not errorlevel 1 (
 
 echo.
 echo Caching detection models ^(so the GoPro works offline^)...
-.venv\Scripts\python.exe -c "from ultralytics import YOLO; [YOLO(m) for m in ['yolov8n-seg.pt','yolov8s-seg.pt','yolov8m-seg.pt']]"
+.venv\Scripts\python.exe -c "from ultralytics import YOLO; [YOLO(m) for m in ['yolov8n.pt','yolov8s.pt','yolov8m.pt']]"
 .venv\Scripts\python.exe -c "import imageio_ffmpeg; print('ffmpeg:', imageio_ffmpeg.get_ffmpeg_exe())"
 
 echo.

@@ -10,4 +10,4 @@ if not exist ".venv\Scripts\python.exe" (
   echo No virtualenv yet - running setup first...
   call "%~dp0setup.bat" || exit /b 1
 )
-.venv\Scripts\python.exe tracker.py --gopro --model yolov8m-seg.pt --motion %*
+.venv\Scripts\python.exe tracker.py --gopro --model yolov8m.pt %*

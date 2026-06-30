@@ -47,28 +47,23 @@ WINDOW = "muc.io tracker"
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(HERE, "settings.json")
 
-# Class focus groups (cycled with the C key).
-GROUP_ORDER = ["all", "people", "vehicles", "animals"]
-GROUPS = {
-    "all": None,
-    "people": {"person"},
-    "vehicles": {"car", "truck", "bus", "motorcycle", "motorbike", "bicycle",
-                 "train", "airplane", "aeroplane", "boat"},
-    "animals": {"bird", "cat", "dog", "horse", "sheep", "cow", "elephant",
-                "bear", "zebra", "giraffe"},
-}
+# Only the outdoor moving things we care about — COCO class ids. Everything
+# else (cups, chairs, laptops, ...) is filtered out at the detector.
+WANTED_IDS = [0,        # person
+              2, 3, 5, 7,    # car, motorcycle, bus, truck  (ground vehicles)
+              4,        # airplane
+              14,       # bird
+              15, 16, 17, 18, 19, 20, 21, 22, 23]  # cat dog horse sheep cow
+#                                                    elephant bear zebra giraffe
 
 KEYHELP = [
-    ("D", "outline dots"), ("T", "tracers"), ("Z", "zoom insets"),
-    ("L", "labels"), ("B", "bracket targets"), ("V", "velocity + prediction"),
-    ("M", "moving objects only"), ("C", "cycle class focus"),
-    ("N", "motion layer (tiny movers)"),
-    ("H", "activity heatmap"), ("G", "radar sweep"), ("I", "stats panel"),
-    ("Scroll / + -", "zoom in / out (toward cursor)"),
+    ("D", "movement dots"), ("B", "object boxes"), ("L", "labels"),
+    ("V", "prediction arrows"), ("Z", "zoom boxes (moving objects)"),
+    ("Scroll / + -", "zoom the whole frame (toward cursor)"),
     ("Right-drag", "pan when zoomed"), ("0", "reset zoom"),
-    ("E", "mirror image"), ("F", "fullscreen"), ("R", "record video"),
+    ("Click", "lock onto an object (big zoom)"), ("X", "clear lock"),
+    ("F", "fullscreen"), ("E", "mirror"), ("R", "record video"),
     ("P", "save photo"), ("[ ]", "less / more sensitive"),
-    ("Click", "lock onto an object"), ("X", "clear lock"),
     ("SPACE", "pause"), ("?", "this help"), ("Q / Esc", "quit"),
 ]
 
@@ -321,22 +316,21 @@ def draw_radar(frame, phase):
     cv2.addWeighted(ov, 0.20, frame, 0.80, 0, frame)
 
 
-def draw_outline_dots(frame, polygon, color, phase=0, target_dots=42):
-    if polygon is None or len(polygon) < 3:
+def draw_movement_dots(frame, prev_gray, gray, color, step=7, thresh=20):
+    """Scatter dots wherever the image actually moved since the last frame —
+    a live 'this is where motion is happening' field (capped for performance)."""
+    if prev_gray is None or prev_gray.shape != gray.shape:
         return
-    step = max(1, len(polygon) // target_dots)
-    for (x, y) in polygon[::step].astype(int):          # steady (no pulsing)
-        cv2.circle(frame, (x, y), 3, (15, 15, 15), -1, cv2.LINE_AA)
-        cv2.circle(frame, (x, y), 2, color, -1, cv2.LINE_AA)
-
-
-def draw_tracer(frame, points, color):
-    n = len(points)
-    for i in range(1, n):
-        a = i / n
-        thick = max(1, int(round(S(3) * a)))
-        col = tuple(int(c * (0.25 + 0.75 * a)) for c in color)
-        cv2.line(frame, points[i - 1], points[i], col, thick, cv2.LINE_AA)
+    sub = cv2.absdiff(gray[::step, ::step], prev_gray[::step, ::step])
+    ys, xs = np.where(sub > thresh)
+    n = len(xs)
+    if n == 0:
+        return
+    skip = max(1, n // 1500)
+    r = S(2)
+    for k in range(0, n, skip):
+        cv2.circle(frame, (int(xs[k]) * step, int(ys[k]) * step), r,
+                   color, -1, cv2.LINE_AA)
 
 
 def draw_velocity(frame, center, vel, color, predict=16):
@@ -795,21 +789,21 @@ class Toasts:
 # --------------------------------------------------------------------------- #
 class TrackerApp:
     DEFAULT_TOGGLES = {
-        "dots": True, "tracers": True, "zoom": True, "labels": True,
-        "boxes": True, "moving": False, "velocity": True, "heatmap": False,
-        "info": False, "radar": False, "motion": False,
+        "dots": True,       # movement dots
+        "boxes": True,      # object box outlines
+        "labels": True,     # class + confidence
+        "velocity": True,   # prediction arrows
+        "zoom": True,       # zoom boxes for moving objects
     }
 
     def __init__(self, args):
         self.args = args
         self.toggles = dict(self.DEFAULT_TOGGLES)
         self.sens = clamp(int(round((0.9 - args.conf) / 0.0085)), 1, 100)
-        self.focus_idx = 0
         self.mirror = False
         self.fullscreen = False
 
         self.states = {}                 # id -> TrackState
-        self.seen = {}                   # class name -> set of ids (session)
         self.toasts = Toasts()
         self.selected_id = None
         self.pending_click = None
@@ -820,8 +814,6 @@ class TrackerApp:
         self.fps_hist = deque(maxlen=90)
         self.writer = None
         self.rec_name = ""
-        self.heat = None
-        self.blob = gaussian_patch()
         self.start_time = time.time()
         self.device = "cpu"
         self.gopro = None
@@ -833,22 +825,16 @@ class TrackerApp:
         self._vw = self._vh = 0     # current view size (set each frame)
         self._pan_last = None
         self.zoom_slots = {}        # track id -> fixed rail slot index (stable)
+        self.zoom_hold = {}         # track id -> last frame it was "moving"
+        self.prev_gray = None       # previous frame (grayscale) for movement dots
         self.model_name = ""
-        self.bgsub = None           # motion background subtractor (lazy)
-        self.supp = SuppTracker()   # tracker for motion / tiled detections
 
         self.load_settings()
-        if getattr(args, "motion", False):
-            self.toggles["motion"] = True
 
     # sensitivity slider <-> confidence threshold
     @property
     def conf(self):
         return round(0.9 - (self.sens / 100.0) * 0.85, 3)
-
-    @property
-    def focus(self):
-        return GROUP_ORDER[self.focus_idx]
 
     # ---- settings persistence ------------------------------------------- #
     def load_settings(self):
@@ -861,15 +847,13 @@ class TrackerApp:
             if k in self.toggles:
                 self.toggles[k] = bool(v)
         self.sens = clamp(int(data.get("sens", self.sens)), 1, 100)
-        self.focus_idx = clamp(int(data.get("focus_idx", 0)), 0, len(GROUP_ORDER) - 1)
         self.mirror = bool(data.get("mirror", False))
 
     def save_settings(self):
         try:
             with open(SETTINGS_PATH, "w") as f:
                 json.dump({"toggles": self.toggles, "sens": self.sens,
-                           "focus_idx": self.focus_idx, "mirror": self.mirror},
-                          f, indent=2)
+                           "mirror": self.mirror}, f, indent=2)
         except OSError:
             pass
 
@@ -934,14 +918,14 @@ class TrackerApp:
         return cv2.resize(crop, (W, H), interpolation=cv2.INTER_LINEAR)
 
     def _resolve_model_name(self):
-        """Pick a model for the source unless one was given explicitly. A
-        low-res GoPro WiFi feed gets the fast nano model (a heavier one barely
-        helps on low-detail video); cameras/files get the accurate small one."""
+        """Pick a lean *detection* model (no segmentation masks needed for our
+        visuals → much faster). GoPro/low-res gets nano; cameras/files get small.
+        We only ever report the WANTED_IDS classes, so the rest is ignored."""
         if self.args.model != "auto":
             return self.args.model
         is_gopro = (self.args.gopro
                     or str(self.args.source).lower().startswith("udp://"))
-        return "yolov8n-seg.pt" if is_gopro else "yolov8s-seg.pt"
+        return "yolov8n.pt" if is_gopro else "yolov8s.pt"
 
     # ---- main loop ------------------------------------------------------ #
     def run(self):
@@ -1065,12 +1049,10 @@ class TrackerApp:
         set_ui_scale(H)                  # scale all UI to the frame resolution
         diag = math.hypot(H, W)
         clean = frame.copy()
-        if self.heat is None or self.heat.shape != (H, W):
-            self.heat = np.zeros((H, W), np.float32)
-
         res = model.track(frame, persist=True, conf=self.conf, iou=0.5,
                           imgsz=self.args.imgsz, device=self.device,
-                          verbose=False, tracker="bytetrack.yaml")[0]
+                          classes=WANTED_IDS, verbose=False,
+                          tracker="bytetrack.yaml")[0]
 
         boxes = res.boxes
         polys = res.masks.xy if res.masks is not None else None
@@ -1106,12 +1088,8 @@ class TrackerApp:
                 s_cls, s_conf = st.smoothed()
                 vx, vy = st.velocity()
                 name = names.get(s_cls, str(s_cls))
-                poly = polys[i] if polys is not None and i < len(polys) else None
-                items.append(make_item(tid, sbox, name, s_conf, vx, vy, poly, False))
+                items.append(make_item(tid, sbox, name, s_conf, vx, vy, None, False))
                 present.add(tid)
-                if tid >= 0 and len(st.cls_hist) >= 3:
-                    self.seen.setdefault(name, set()).add(tid)
-                self._stamp_heat(cx, cy)
 
         # "coast" tracks that briefly dropped out, so labels don't blink
         COAST = 8
@@ -1128,18 +1106,12 @@ class TrackerApp:
             items.append(make_item(tid, box, names.get(s_cls, str(s_cls)),
                                    s_conf, vx, vy, None, True))
 
-        # supplementary detections: motion blobs + tiled finds (small/far things
-        # the main full-frame pass missed). They get their own ids/trails.
-        if self.toggles["motion"] or self.args.tiles > 1:
-            items += self._supplementary_items(frame, clean, model, names,
-                                               items, diag)
-
-        # decay heatmap & forget long-lost tracks
-        self.heat *= 0.93
+        # forget long-lost tracks
         for tid in [k for k, s in self.states.items()
                     if self.frame_idx - s.last_seen > 45]:
             del self.states[tid]
             self.zoom_slots.pop(tid, None)
+            self.zoom_hold.pop(tid, None)
 
         # resolve a pending click into a selection (smallest box hit)
         if self.pending_click is not None:
@@ -1152,51 +1124,32 @@ class TrackerApp:
                     if hit is None or it["area"] < hit["area"]:
                         hit = it
             self.selected_id = hit["id"] if hit else None
-            self.toasts.add(f"Locked on {hit['name']} #{hit['id']}" if hit
-                            else "Lock cleared")
+            self.toasts.add(f"Locked on {hit['name']}" if hit else "Lock cleared")
 
-        # draw biggest first so small things end up on top
+        # --- movement dots: dots wherever the scene actually moved this frame ---
+        if self.toggles["dots"]:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            draw_movement_dots(frame, self.prev_gray, gray, T_CYAN)
+            self.prev_gray = gray
+        else:
+            self.prev_gray = None
+
         items.sort(key=lambda d: d["area"], reverse=True)
-        group = GROUPS[self.focus]
         shown = Counter()
-
-        if self.toggles["heatmap"]:
-            self._draw_heatmap(frame)
-        if self.toggles["radar"]:
-            draw_radar(frame, self.frame_idx * 0.12)
-
         for it in items:
-            sel = it["id"] == self.selected_id
-            if group is not None and it["name"] not in group and not sel:
-                continue
-            if self.toggles["moving"] and not it["moving"] and not sel:
-                continue
-            if it.get("supp"):
-                base = T_MOVER                       # motion / tiled find
-            else:
-                base = tactical_color(it["id"] if it["id"] >= 0 else hash(it["name"]))
+            base = tactical_color(it["id"] if it["id"] >= 0 else hash(it["name"]))
             color = tuple(int(c * 0.5) for c in base) if it["coast"] else base
             x1, y1, x2, y2 = it["box"]
             if self.toggles["boxes"]:
-                draw_brackets(frame, it["box"], color)
-                if not it["coast"]:
-                    draw_reticle(frame, it["center"], color)
-            if self.toggles["dots"] and not it["coast"]:
-                draw_outline_dots(frame, it["poly"], color)
-            if self.toggles["tracers"]:
-                tr = it.get("trail")
-                if tr is None:
-                    st = self.states.get(it["id"])
-                    tr = list(st.trail) if st else None
-                if tr:
-                    draw_tracer(frame, tr, color)
-            if self.toggles["velocity"] and not it["coast"]:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, S(2), cv2.LINE_AA)
+            if self.toggles["velocity"] and it["moving"] and not it["coast"]:
                 draw_velocity(frame, it["center"], it["vel"], color)
             if self.toggles["labels"]:
-                draw_label(frame, x1, y1, it["name"], it["conf"], color, it["id"],
-                           it["moving"] and not it["coast"], it["speed"] * 30)
+                draw_label(frame, x1, y1, it["name"], it["conf"], color, None,
+                           it["moving"] and not it["coast"])
             shown[it["name"]] += 1
 
+        # zoom boxes — ONLY for moving objects (motion-gated, with hysteresis)
         if self.toggles["zoom"]:
             self._draw_zoom_rail(frame, clean, items, W, H)
 
@@ -1209,8 +1162,6 @@ class TrackerApp:
                  0.5, T_AMBER)
 
         self._draw_hud(frame, shown)
-        if self.toggles["info"]:
-            self._draw_stats(frame)
         self._draw_zoom_minimap(frame)
         if self.writer is not None:
             self._draw_rec_badge(frame)
@@ -1377,19 +1328,21 @@ class TrackerApp:
                      max(0, (W - reserve_left - margin + gap) // (SW + gap)))
         if nslots <= 0:
             return
-        # candidates = everything currently on screen (detected, or briefly
-        # coasting through a dropout), minus the locked target (own follow-cam)
         cur = {it["id"]: it for it in items
                if it["id"] >= 0 and it["id"] != self.selected_id}
-        # release a slot only when its object has actually left the screen
-        for t in list(self.zoom_slots):
-            if t not in cur:
+        # MOTION GATE (balanced): a zoom box is for objects that are moving.
+        # A ~1s hold means a brief stop doesn't drop the box (no flicker).
+        HOLD = 20
+        for it in cur.values():
+            if it["moving"] and not it["coast"]:
+                self.zoom_hold[it["id"]] = self.frame_idx
+        wanting = [t for t in cur
+                   if self.frame_idx - self.zoom_hold.get(t, -999) <= HOLD]
+        for t in list(self.zoom_slots):          # release when no longer wanted
+            if t not in wanting:
                 del self.zoom_slots[t]
         used = set(self.zoom_slots.values())
-        # fill free slots with as-yet-unslotted objects, biggest first; once an
-        # object holds a slot it keeps it → no per-frame reshuffling, no flicker
-        for t in sorted((tid for tid, it in cur.items()
-                         if tid not in self.zoom_slots and not it["coast"]),
+        for t in sorted((t for t in wanting if t not in self.zoom_slots),
                         key=lambda tid: cur[tid]["area"], reverse=True):
             free = next((s for s in range(nslots) if s not in used), None)
             if free is None:
@@ -1438,21 +1391,14 @@ class TrackerApp:
     def _draw_hud(self, frame, shown):
         H, W = frame.shape[:2]
         n = sum(shown.values())
-        el = int(time.time() - self.start_time)
-        oo = lambda b: "ON " if b else "OFF"
         lines = [
-            ("MUC.IO // TACTICAL TRACK SUITE", T_GREEN),
-            (f"MODE TRACK   NET {self._model_tag()}@{self.args.imgsz}"
-             f"{('x'+str(self.args.tiles**2)) if self.args.tiles > 1 else ''}"
-             f"   OBJ {n:02d}", T_GREEN_DIM),
-            (f"FPS {self.fps:04.1f}   {W}x{H}   {self.device.upper()}   "
-             f"FOCUS {self.focus.upper()}", T_GREEN_DIM),
-            (f"REC {oo(self.writer is not None)}  MOTION {oo(self.toggles['motion'])}  "
-             f"HEAT {oo(self.toggles['heatmap'])}  RADAR {oo(self.toggles['radar'])}",
-             T_GREEN_DIM),
-            (f"T+{el//3600:02d}:{el%3600//60:02d}:{el%60:02d}   "
-             f"FRAME {self.frame_idx:05d}", T_GREEN_DIM),
+            ("MUC.IO TRACKER", T_GREEN),
+            (f"FPS {self.fps:04.1f}   NET {self._model_tag()}   "
+             f"{self.device.upper()}   OBJ {n:02d}", T_GREEN_DIM),
         ]
+        if shown:
+            lines.append(("  " + "  ".join(f"{v}x{k.upper()}"
+                          for k, v in shown.most_common(4)), T_CYAN))
         if self.gopro is not None:                 # GoPro battery readout
             pct = self.gopro.battery
             if pct is None:
@@ -1465,9 +1411,6 @@ class TrackerApp:
                 chg = " CHG" if self.gopro.charging else ""
                 bcol = T_GREEN if pct > 50 else T_AMBER if pct > 20 else T_RED
                 lines.insert(1, (f"GOPRO BATT {pct:3d}% {bar}{chg}", bcol))
-        if shown:
-            lines.append(("DET " + "  ".join(f"{v}x{k.upper()}"
-                          for k, v in shown.most_common(3)), T_CYAN))
         row = lh(0.5)
         pw = max(mono_w(s, 0.5) for s, _ in lines) + S(26)
         ph = row * len(lines) + S(22)
@@ -1489,13 +1432,13 @@ class TrackerApp:
         bh = _mono_size(0.5) + S(14)
         panel(frame, 0, H - bh, W, bh, alpha=0.55, radius=0)
         cv2.line(frame, (0, H - bh), (W, H - bh), T_GREEN, S(1), cv2.LINE_AA)
-        segs = [("R", "REC", self.writer is not None),
-                ("0", f"ZOOM {self.zoom:.1f}x", self.zoom > 1.001),
-                ("C", self.focus.upper(), False),
-                ("N", "MOTION", self.toggles["motion"]),
-                ("H", "HEAT", self.toggles["heatmap"]),
-                ("G", "RADAR", self.toggles["radar"]),
-                ("I", "INTEL", self.toggles["info"]),
+        segs = [("0", f"ZOOM {self.zoom:.1f}x", self.zoom > 1.001),
+                ("D", "DOTS", self.toggles["dots"]),
+                ("B", "BOX", self.toggles["boxes"]),
+                ("L", "LABEL", self.toggles["labels"]),
+                ("V", "PREDICT", self.toggles["velocity"]),
+                ("Z", "ZOOMBOX", self.toggles["zoom"]),
+                ("R", "REC", self.writer is not None),
                 ("?", "HELP", self.show_help)]
         x = S(12)
         for k, lab, active in segs:
@@ -1568,8 +1511,6 @@ class TrackerApp:
             self.paused = not self.paused
         elif key == ord("d"):
             self.toggles["dots"] ^= True
-        elif key == ord("t"):
-            self.toggles["tracers"] ^= True
         elif key == ord("z"):
             self.toggles["zoom"] ^= True
         elif key == ord("l"):
@@ -1578,24 +1519,6 @@ class TrackerApp:
             self.toggles["boxes"] ^= True
         elif key == ord("v"):
             self.toggles["velocity"] ^= True
-        elif key == ord("m"):
-            self.toggles["moving"] ^= True
-        elif key == ord("h"):
-            self.toggles["heatmap"] ^= True
-            self.toasts.add(f"Heatmap {'on' if self.toggles['heatmap'] else 'off'}")
-        elif key == ord("i"):
-            self.toggles["info"] ^= True
-        elif key == ord("g"):
-            self.toggles["radar"] ^= True
-            self.toasts.add(f"Radar {'on' if self.toggles['radar'] else 'off'}")
-        elif key == ord("n"):
-            self.toggles["motion"] ^= True
-            self.bgsub = None        # relearn background on (re)enable
-            self.toasts.add("Motion detection ON (best with a still camera)"
-                            if self.toggles["motion"] else "Motion detection off")
-        elif key == ord("c"):
-            self.focus_idx = (self.focus_idx + 1) % len(GROUP_ORDER)
-            self.toasts.add(f"Focus: {self.focus}")
         elif key == ord("e"):
             self.mirror = not self.mirror
             self.toasts.add(f"Mirror {'on' if self.mirror else 'off'}")
