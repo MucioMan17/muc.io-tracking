@@ -711,7 +711,7 @@ class TrackerApp:
         self.toggles = dict(self.DEFAULT_TOGGLES)
         self.sens = clamp(int(round((0.9 - args.conf) / 0.0085)), 1, 100)
         self.dot_sens = 60          # movement-dot sensitivity (slider 1-100)
-        self.target_dots = 20       # min dots in a clump to become a target
+        self.min_obj = 20           # min moving-object size to target (slider 1-100)
         self.zoom_sens = 82         # zoom motion-gate sensitivity (slider 1-100)
         self.mirror = False
         self.fullscreen = False
@@ -743,10 +743,11 @@ class TrackerApp:
         self._pan_last = None
         self.zoom_slots = {}        # track id -> fixed rail slot index (stable)
         self.zoom_hold = {}         # track id -> last frame it was "moving"
-        self.prev_gray = None       # previous frame (grayscale) for movement dots
         self.motion_dots = []        # [x, y, life] fading green movement dots
-        self.ctracks = {}           # dot-cluster tracks: id -> {box, seen, last}
-        self.cnid = 100000          # cluster id counter
+        self.bgsub = cv2.createBackgroundSubtractorMOG2(
+            history=250, varThreshold=24, detectShadows=False)  # moving-fg model
+        self.ctracks = {}           # moving-object tracks: id -> {box, seen, last}
+        self.cnid = 100000          # track id counter
         self.model_name = ""
 
         self.load_settings()
@@ -768,8 +769,7 @@ class TrackerApp:
                 self.toggles[k] = bool(v)
         self.sens = clamp(int(data.get("sens", self.sens)), 1, 100)
         self.dot_sens = clamp(int(data.get("dot_sens", self.dot_sens)), 1, 100)
-        self.target_dots = clamp(int(data.get("target_dots",
-                                              self.target_dots)), 3, 120)
+        self.min_obj = clamp(int(data.get("min_obj", self.min_obj)), 1, 100)
         self.mirror = bool(data.get("mirror", False))
 
     def save_settings(self):
@@ -777,7 +777,7 @@ class TrackerApp:
             with open(SETTINGS_PATH, "w") as f:
                 json.dump({"toggles": self.toggles, "sens": self.sens,
                            "dot_sens": self.dot_sens,
-                           "target_dots": self.target_dots,
+                           "min_obj": self.min_obj,
                            "mirror": self.mirror}, f, indent=2)
         except OSError:
             pass
@@ -927,8 +927,8 @@ class TrackerApp:
         cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
         cv2.createTrackbar("Dots", WINDOW, self.dot_sens, 100,
                            lambda v: setattr(self, "dot_sens", max(1, v)))
-        cv2.createTrackbar("Target dots", WINDOW, self.target_dots, 120,
-                           lambda v: setattr(self, "target_dots", max(3, v)))
+        cv2.createTrackbar("Min size", WINDOW, self.min_obj, 100,
+                           lambda v: setattr(self, "min_obj", max(1, v)))
         cv2.setMouseCallback(WINDOW, self._on_mouse)
         self.toasts.add("+ / - zoom toward the mouse.  Click SETTINGS "
                         "(bottom-left) to toggle things.", 6)
@@ -957,8 +957,7 @@ class TrackerApp:
                 self._vw, self._vh = frame.shape[1], frame.shape[0]
                 frame = self._apply_zoom(frame)        # crop to the zoom region
                 self.dot_sens = max(1, cv2.getTrackbarPos("Dots", WINDOW))
-                self.target_dots = max(3, cv2.getTrackbarPos("Target dots",
-                                                             WINDOW))
+                self.min_obj = max(1, cv2.getTrackbarPos("Min size", WINDOW))
                 annotated = self.process(frame)
                 last_annotated = annotated
                 if self._do_photo:
@@ -1010,24 +1009,33 @@ class TrackerApp:
         self.pending_click = None
         clean = frame.copy()             # clean video for the zoom crops
 
-        # 1) sample motion into dots (always — they drive the boxes & zoom)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        self._update_motion_dots(gray)
+        # Moving-foreground mask via background subtraction (MOG2) — segments the
+        # WHOLE moving object as a solid blob (not just its edges), so each mover
+        # is one box. Shared by the dots AND the object detection. The "Dots"
+        # slider sets the sensitivity (low end stays usable, never effectively
+        # off); high end is very sensitive.
+        self.bgsub.setVarThreshold(clamp(int(42 - self.dot_sens * 0.30), 12, 42))
+        mask = self.bgsub.apply(frame)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                                np.ones((3, 3), np.uint8))   # drop speckle noise
+
+        # 1) movement dots — kept purely as a visual now
+        self._update_motion_dots(mask)
         if self.toggles["dots"]:
             self._render_motion_dots(frame)
 
-        # 2) the dots ARE the detector: clusters of >=20 dots become targets,
-        #    tracked so the box & zoom follow the dots smoothly
-        items = self._track_clusters(self._dot_clusters(H, W))
+        # 2) target every moving OBJECT (motion blob), tracked so the box & zoom
+        #    follow it smoothly
+        items = self._track_movers(self._moving_objects(mask, H, W))
 
-        # 3) boxes around the clusters (from the dots)
+        # 3) boxes around the moving objects
         if self.toggles["boxes"]:
             for it in items:
                 x1, y1, x2, y2 = it["box"]
                 cv2.rectangle(frame, (x1, y1), (x2, y2),
                               tactical_color(it["id"]), 1, cv2.LINE_AA)
 
-        # 4) zoom boxes for the same clusters, following them
+        # 4) zoom boxes for the same moving objects, following them
         if self.toggles["zoom"]:
             self._draw_zoom_rail(frame, clean, items, W, H)
 
@@ -1041,13 +1049,10 @@ class TrackerApp:
         return _HUD.flush(frame)
 
     # ---- small fading green movement dots ------------------------------ #
-    def _update_motion_dots(self, gray):
-        """Sample new moving-pixel dots, fade the old, cap the total. Always run
-        (drives the boxes/zoom even when the dots aren't drawn)."""
-        if self.prev_gray is not None and self.prev_gray.shape == gray.shape:
-            thresh = clamp(int(55 - self.dot_sens * 0.5), 5, 55)  # Dots slider
-            diff = cv2.absdiff(gray, self.prev_gray)
-            ys, xs = np.where(diff > thresh)
+    def _update_motion_dots(self, mask):
+        """Sample new dots from the motion mask, fade the old, cap the total."""
+        if mask is not None:
+            ys, xs = np.where(mask)
             n = len(xs)
             if n:
                 sel = np.random.choice(n, min(40, n), replace=False)
@@ -1059,7 +1064,6 @@ class TrackerApp:
             if life > 0.06:
                 alive.append([x, y, life])
         self.motion_dots = alive[-220:]
-        self.prev_gray = gray
 
     def _render_motion_dots(self, frame):
         """Draw the tiny green dots, alpha-fading (transparent, stays green)."""
@@ -1073,37 +1077,32 @@ class TrackerApp:
             a = amap[m][:, None]
             frame[m] = (frame[m] * (1 - a) + _DOT_GREEN * a).astype(np.uint8)
 
-    # ---- the dots ARE the detector: cluster them into moving targets --- #
-    def _dot_clusters(self, H, W):
-        """Group nearby dots; a clump of >=20 dots is a moving target. Returns a
-        list of tight bounding boxes around such clumps."""
-        pts = [(int(x), int(y)) for x, y, _ in self.motion_dots
-               if 0 <= y < H and 0 <= x < W]
-        if len(pts) < 20:
+    # ---- detect moving OBJECTS straight from the motion mask ----------- #
+    def _moving_objects(self, mask, H, W):
+        """Find moving objects directly from the motion mask: merge each object's
+        moving pixels into one blob, then box the blobs big enough to count
+        (Min size slider). Returns bounding boxes, biggest first."""
+        if mask is None:
             return []
-        sc = 8                                     # cluster on a /8 grid (fast)
-        gm = np.zeros((H // sc + 1, W // sc + 1), np.uint8)
-        for x, y in pts:
-            gm[y // sc, x // sc] = 255
-        gm = cv2.dilate(gm, np.ones((5, 5), np.uint8), iterations=2)  # merge near
-        num, labels = cv2.connectedComponents(gm)
-        groups = {}
-        for x, y in pts:
-            lbl = int(labels[y // sc, x // sc])
-            if lbl > 0:
-                groups.setdefault(lbl, []).append((x, y))
+        k = max(3, S(9))
+        ker = np.ones((k, k), np.uint8)
+        m = cv2.dilate(mask, ker, iterations=2)        # join an object's pixels
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, ker)  # fill gaps -> solid blob
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Min size slider (1-100) → min blob area as a fraction of the frame
+        min_area = (H * W) * (0.0002 + (self.min_obj / 100.0) * 0.02)
         boxes = []
-        for comp in groups.values():
-            if len(comp) < self.target_dots:       # the "min dots" rule (slider)
-                continue
-            xs = [p[0] for p in comp]
-            ys = [p[1] for p in comp]
-            boxes.append((min(xs), min(ys), max(xs), max(ys)))
-        return boxes
+        for c in cnts:
+            x, y, w, h = cv2.boundingRect(c)
+            if w * h >= min_area:
+                boxes.append((x, y, x + w, y + h))
+        boxes.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+        return boxes[:12]                              # cap to the biggest few
 
-    def _track_clusters(self, boxes):
-        """Match clusters to last frame (IoU) so each keeps a stable id and an
-        EMA-smoothed box → the box/zoom follows the dots smoothly. Returns items."""
+    def _track_movers(self, boxes):
+        """Match moving objects to last frame (IoU) so each keeps a stable id and
+        an EMA-smoothed box → the box/zoom follows the object smoothly. Returns
+        items."""
         free = set(self.ctracks)
         for b in boxes:
             best, bid = 0.1, None
