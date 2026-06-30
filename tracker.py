@@ -721,7 +721,7 @@ class TrackerApp:
         self.zoom_slots = {}        # track id -> fixed rail slot index (stable)
         self.zoom_hold = {}         # track id -> last frame it was "moving"
         self.prev_gray = None       # previous frame (grayscale) for movement dots
-        self.motion_dots = {}       # (gx,gy) -> life, fading green movement dots
+        self.motion_dots = []        # [x, y, life] fading green movement dots
         self.model_name = ""
 
         self.load_settings()
@@ -1073,36 +1073,29 @@ class TrackerApp:
 
     # ---- fading green movement dots ------------------------------------ #
     def _draw_movement_dots(self, frame, gray):
-        """A sparse field of GREEN dots wherever the image moved, that fade out
-        over ~10 frames — so movers leave a short comet-trail, not a flood."""
-        H, W = gray.shape
-        step = max(14, W // 46)                  # spacing → keeps it sparse
+        """GREEN dots sampled from the actual moving pixels — so they CLUSTER
+        (and overlap) on whatever is moving rather than spreading out — fading
+        over ~10 frames. Total is capped so it never floods."""
         if self.prev_gray is not None and self.prev_gray.shape == gray.shape:
-            diff = cv2.absdiff(gray[::step, ::step], self.prev_gray[::step, ::step])
-            ys, xs = np.where(diff > 28)
-            pts = list(zip(xs.tolist(), ys.tolist()))
-            if len(pts) > 45:                    # cap new dots per frame
-                pick = np.linspace(0, len(pts) - 1, 45).astype(int)
-                pts = [pts[i] for i in pick]
-            for gx, gy in pts:
-                self.motion_dots[(gx, gy)] = 1.0
-        r = S(2)
-        dead = []
-        for key, life in self.motion_dots.items():
-            life -= 0.10                         # fade out
-            if life <= 0.05:
-                dead.append(key)
+            diff = cv2.absdiff(gray, self.prev_gray)
+            ys, xs = np.where(diff > 25)
+            n = len(xs)
+            if n:
+                # random sample → denser where there's more motion (the mover)
+                sel = np.random.choice(n, min(40, n), replace=False)
+                for i in sel:
+                    self.motion_dots.append([int(xs[i]), int(ys[i]), 1.0])
+        r = S(3)
+        alive = []
+        for x, y, life in self.motion_dots:
+            life -= 0.10                          # fade out
+            if life <= 0.06:
                 continue
-            self.motion_dots[key] = life
-            gx, gy = key
-            col = (int(70 * life), int(255 * life), int(120 * life))   # green BGR
-            cv2.circle(frame, (gx * step, gy * step), r, col, -1, cv2.LINE_AA)
-        for k in dead:
-            del self.motion_dots[k]
-        if len(self.motion_dots) > 200:          # hard cap, drop the faintest
-            for k in sorted(self.motion_dots, key=self.motion_dots.get)[
-                    :len(self.motion_dots) - 200]:
-                del self.motion_dots[k]
+            cv2.circle(frame, (x, y), r,
+                       (int(70 * life), int(255 * life), int(110 * life)),
+                       -1, cv2.LINE_AA)
+            alive.append([x, y, life])
+        self.motion_dots = alive[-220:]           # hard cap on total
 
     # ---- pinned zoom rail ---------------------------------------------- #
     def _draw_zoom_rail(self, frame, clean, items, W, H):
