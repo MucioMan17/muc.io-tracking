@@ -29,7 +29,6 @@ import argparse
 import json
 import math
 import os
-import platform
 import socket
 import subprocess
 import sys
@@ -76,13 +75,8 @@ def clamp(v, lo, hi):
 
 
 def cam_backend():
-    """The right OpenCV capture backend for local cameras on this OS."""
-    s = platform.system()
-    if s == "Darwin":
-        return cv2.CAP_AVFOUNDATION
-    if s == "Windows":
-        return cv2.CAP_DSHOW            # DirectShow — reliable on Windows
-    return cv2.CAP_ANY
+    """OpenCV capture backend for local cameras on macOS."""
+    return cv2.CAP_AVFOUNDATION
 
 
 def iou_xyxy(a, b):

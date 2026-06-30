@@ -227,9 +227,6 @@ the active setup, e.g. `NET 8M@1280x4` (model · imgsz · tiles).
 You can also just **digital-zoom** into a region (two-finger scroll) — detection
 then runs only on that crop, so distant things in it pop right out.
 
-> 💪 On a powerful (NVIDIA) machine, see [`windows/`](windows/README.md) — it
-> installs CUDA PyTorch and has a one-click high-quality GoPro preset.
-
 ## Files
 
 - `tracker.py` — the whole application.
