@@ -563,7 +563,7 @@ class FFmpegStream:
                 "-fflags", "nobuffer", "-flags", "low_delay",
                 "-err_detect", "ignore_err",
                 # short analysis window so the live view starts quickly
-                "-probesize", "500000", "-analyzeduration", "500000",
+                "-probesize", "3000000", "-analyzeduration", "3000000",
                 "-i", url, "-an", "-vf", vf,
                 "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
 
@@ -615,7 +615,7 @@ class FFmpegStream:
 # reads. No HDMI / capture card / GoPro Webcam app required.
 # --------------------------------------------------------------------------- #
 GOPRO_DEFAULT_IP = "10.5.5.9"
-GOPRO_UDP_URL = "udp://@:8554"
+GOPRO_UDP_URL = "udp://0.0.0.0:8554"   # 0.0.0.0 binds reliably on Windows too
 
 
 class GoProStream:
@@ -746,7 +746,7 @@ class SuppTracker:
                 self.tracks[bid] = {"box": list(map(float, box)),
                                     "trail": deque(maxlen=32), "cls": cls,
                                     "conf": conf or 0.5, "labelled": -999,
-                                    "last": frame_idx}
+                                    "last": frame_idx, "seen": 0}
             else:
                 free.discard(bid)
                 t = self.tracks[bid]
@@ -756,6 +756,7 @@ class SuppTracker:
                     t["cls"], t["conf"] = cls, conf
             t = self.tracks[bid]
             t["last"] = frame_idx
+            t["seen"] += 1
             cx = int((t["box"][0] + t["box"][2]) / 2)
             cy = int((t["box"][1] + t["box"][3]) / 2)
             t["trail"].append((cx, cy))
@@ -1245,7 +1246,7 @@ class TrackerApp:
         even see (best with a still/tripod camera)."""
         if self.bgsub is None:
             self.bgsub = cv2.createBackgroundSubtractorMOG2(
-                history=400, varThreshold=40, detectShadows=False)
+                history=400, varThreshold=60, detectShadows=False)
         H, W = frame.shape[:2]
         fg = self.bgsub.apply(frame)
         fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)[1]
@@ -1256,7 +1257,7 @@ class TrackerApp:
         out = []
         for c in cnts:
             a = cv2.contourArea(c)
-            if a < area * 0.00015 or a > area * 0.25:   # ignore noise & pans
+            if a < area * 0.0006 or a > area * 0.25:    # ignore noise & pans
                 continue
             x, y, w, h = cv2.boundingRect(c)
             out.append(((x, y, x + w, y + h), None, 0.5))
@@ -1317,16 +1318,26 @@ class TrackerApp:
             cands += self._motion_boxes(frame)
         if self.args.tiles > 1:
             cands += self._tile_dets(frame, model)
-        # only keep finds the main full-frame pass missed
+        # only keep finds the main pass missed (drop any blob whose centre
+        # sits inside an already-detected object -> kills the pile-on flood)
         mboxes = [it["box"] for it in main_items]
-        cands = [(b, cl, cf) for (b, cl, cf) in cands
-                 if not any(iou_xyxy(b, mb) > 0.3 for mb in mboxes)]
+
+        def _covered(b):
+            bx, by = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+            return any((mb[0] <= bx <= mb[2] and mb[1] <= by <= mb[3])
+                       or iou_xyxy(b, mb) > 0.2 for mb in mboxes)
+        cands = [(b, cl, cf) for (b, cl, cf) in cands if not _covered(b)]
         if not cands:
             return []
-        tracks = self.supp.update([(b, cl, cf) for (b, cl, cf) in cands],
-                                  self.frame_idx)
+        self.supp.update([(b, cl, cf) for (b, cl, cf) in cands], self.frame_idx)
+        # only movers that have persisted a few frames (filters sensor noise),
+        # coasted briefly so they don't flicker, and capped to the biggest few
+        steady = [(tid, t) for tid, t in self.supp.tracks.items()
+                  if t["seen"] >= 4 and self.frame_idx - t["last"] <= 3]
+        steady.sort(key=lambda kt: -(kt[1]["box"][2] - kt[1]["box"][0])
+                    * (kt[1]["box"][3] - kt[1]["box"][1]))
         items = []
-        for tid, t in tracks.items():
+        for tid, t in steady[:8]:
             if t["cls"] is None and self.frame_idx - t["labelled"] > 12:
                 cls, conf = self._classify_crop(clean, t["box"], model)
                 if cls is not None:
@@ -1339,7 +1350,8 @@ class TrackerApp:
                 vx, vy = (tr[-1][0] - tr[-6][0]) / 5, (tr[-1][1] - tr[-6][1]) / 5
             else:
                 vx = vy = 0.0
-            name = names.get(t["cls"], "mover") if t["cls"] is not None else "mover"
+            name = (names.get(t["cls"], "mover")
+                    if t["cls"] is not None and t["conf"] >= 0.5 else "mover")
             items.append({
                 "id": tid, "name": name, "conf": t["conf"],
                 "box": (x1, y1, x2, y2), "center": (cx, cy), "poly": None,
