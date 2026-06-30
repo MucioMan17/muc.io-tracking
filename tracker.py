@@ -125,6 +125,15 @@ def tactical_color(idx):
     return T_PALETTE[abs(int(idx)) % len(T_PALETTE)]
 
 
+def iou_xyxy(a, b):
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / ua if ua > 0 else 0.0
+
+
 # Global UI scale: 1.0 at 720p, grows with resolution so the HUD, labels and
 # zoom boxes stay the same *relative* size instead of shrinking at 1080+.
 UI = 1.0
@@ -735,6 +744,8 @@ class TrackerApp:
         self.zoom_hold = {}         # track id -> last frame it was "moving"
         self.prev_gray = None       # previous frame (grayscale) for movement dots
         self.motion_dots = []        # [x, y, life] fading green movement dots
+        self.ctracks = {}           # dot-cluster tracks: id -> {box, seen, last}
+        self.cnid = 100000          # cluster id counter
         self.model_name = ""
 
         self.load_settings()
@@ -982,20 +993,33 @@ class TrackerApp:
         stream.release()
         cv2.destroyAllWindows()
 
-    # ---- per-frame processing (detection removed) ---------------------- #
+    # ---- per-frame processing (motion-driven, no neural net) ----------- #
     def process(self, frame):
         H, W = frame.shape[:2]
         set_ui_scale(H)                  # scale all UI to the frame resolution
-        self.pending_click = None        # nothing to lock onto without detection
+        self.pending_click = None
+        clean = frame.copy()             # clean video for the zoom crops
 
-        # --- fading green movement dots (frame-diff, no model needed) ---
+        # 1) sample motion into dots (always — they drive the boxes & zoom)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self._update_motion_dots(gray)
         if self.toggles["dots"]:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            self._draw_movement_dots(frame, gray)
-            self.prev_gray = gray
-        else:
-            self.prev_gray = None
-            self.motion_dots.clear()
+            self._render_motion_dots(frame)
+
+        # 2) the dots ARE the detector: clusters of >=20 dots become targets,
+        #    tracked so the box & zoom follow the dots smoothly
+        items = self._track_clusters(self._dot_clusters(H, W))
+
+        # 3) boxes around the clusters (from the dots)
+        if self.toggles["boxes"]:
+            for it in items:
+                x1, y1, x2, y2 = it["box"]
+                cv2.rectangle(frame, (x1, y1), (x2, y2),
+                              tactical_color(it["id"]), 1, cv2.LINE_AA)
+
+        # 4) zoom boxes for the same clusters, following them
+        if self.toggles["zoom"]:
+            self._draw_zoom_rail(frame, clean, items, W, H)
 
         self.hotspots = []           # rebuilt by the toolbar + settings panel
         self._draw_hud(frame)
@@ -1007,10 +1031,9 @@ class TrackerApp:
         return _HUD.flush(frame)
 
     # ---- small fading green movement dots ------------------------------ #
-    def _draw_movement_dots(self, frame, gray):
-        """Tiny GREEN dots sampled from the actual moving pixels (they cluster on
-        the mover) that fade out by going TRANSPARENT (alpha) — staying green,
-        not darkening. Total capped so it never floods."""
+    def _update_motion_dots(self, gray):
+        """Sample new moving-pixel dots, fade the old, cap the total. Always run
+        (drives the boxes/zoom even when the dots aren't drawn)."""
         if self.prev_gray is not None and self.prev_gray.shape == gray.shape:
             thresh = clamp(int(55 - self.dot_sens * 0.5), 5, 55)  # Dots slider
             diff = cv2.absdiff(gray, self.prev_gray)
@@ -1020,21 +1043,91 @@ class TrackerApp:
                 sel = np.random.choice(n, min(40, n), replace=False)
                 for i in sel:
                     self.motion_dots.append([int(xs[i]), int(ys[i]), 1.0])
-        r = max(1, S(1))                          # SMALL dots
-        H, W = frame.shape[:2]
-        amap = np.zeros((H, W), np.float32)        # per-pixel alpha = dot life
         alive = []
         for x, y, life in self.motion_dots:
             life -= 0.10
-            if life <= 0.06:
-                continue
-            cv2.circle(amap, (x, y), r, float(life), -1)
-            alive.append([x, y, life])
+            if life > 0.06:
+                alive.append([x, y, life])
         self.motion_dots = alive[-220:]
-        m = amap > 0.01                            # alpha-blend green where dots are
+        self.prev_gray = gray
+
+    def _render_motion_dots(self, frame):
+        """Draw the tiny green dots, alpha-fading (transparent, stays green)."""
+        r = max(1, S(1))
+        H, W = frame.shape[:2]
+        amap = np.zeros((H, W), np.float32)
+        for x, y, life in self.motion_dots:
+            cv2.circle(amap, (x, y), r, float(life), -1)
+        m = amap > 0.01
         if m.any():
             a = amap[m][:, None]
             frame[m] = (frame[m] * (1 - a) + _DOT_GREEN * a).astype(np.uint8)
+
+    # ---- the dots ARE the detector: cluster them into moving targets --- #
+    def _dot_clusters(self, H, W):
+        """Group nearby dots; a clump of >=20 dots is a moving target. Returns a
+        list of tight bounding boxes around such clumps."""
+        pts = [(int(x), int(y)) for x, y, _ in self.motion_dots
+               if 0 <= y < H and 0 <= x < W]
+        if len(pts) < 20:
+            return []
+        sc = 8                                     # cluster on a /8 grid (fast)
+        gm = np.zeros((H // sc + 1, W // sc + 1), np.uint8)
+        for x, y in pts:
+            gm[y // sc, x // sc] = 255
+        gm = cv2.dilate(gm, np.ones((5, 5), np.uint8), iterations=2)  # merge near
+        num, labels = cv2.connectedComponents(gm)
+        groups = {}
+        for x, y in pts:
+            lbl = int(labels[y // sc, x // sc])
+            if lbl > 0:
+                groups.setdefault(lbl, []).append((x, y))
+        boxes = []
+        for comp in groups.values():
+            if len(comp) < 20:                     # the ">20 dots" rule
+                continue
+            xs = [p[0] for p in comp]
+            ys = [p[1] for p in comp]
+            boxes.append((min(xs), min(ys), max(xs), max(ys)))
+        return boxes
+
+    def _track_clusters(self, boxes):
+        """Match clusters to last frame (IoU) so each keeps a stable id and an
+        EMA-smoothed box → the box/zoom follows the dots smoothly. Returns items."""
+        free = set(self.ctracks)
+        for b in boxes:
+            best, bid = 0.1, None
+            for tid in free:
+                v = iou_xyxy(b, self.ctracks[tid]["box"])
+                if v > best:
+                    best, bid = v, tid
+            if bid is None:
+                self.cnid += 1
+                bid = self.cnid
+                self.ctracks[bid] = {"box": list(map(float, b)), "seen": 0,
+                                     "last": self.frame_idx}
+            else:
+                free.discard(bid)
+                t = self.ctracks[bid]
+                for i in range(4):                 # smooth follow
+                    t["box"][i] = 0.55 * t["box"][i] + 0.45 * b[i]
+            t = self.ctracks[bid]
+            t["last"] = self.frame_idx
+            t["seen"] += 1
+        for tid in [k for k, v in self.ctracks.items()
+                    if self.frame_idx - v["last"] > 8]:
+            del self.ctracks[tid]
+            self.zoom_slots.pop(tid, None)
+            self.zoom_hold.pop(tid, None)
+        items = []
+        for tid, t in self.ctracks.items():
+            if t["seen"] < 2 or self.frame_idx - t["last"] > 3:
+                continue
+            x1, y1, x2, y2 = map(int, t["box"])
+            items.append({"id": tid, "box": (x1, y1, x2, y2), "coast": False,
+                          "center": ((x1 + x2) // 2, (y1 + y2) // 2),
+                          "area": (x2 - x1) * (y2 - y1), "moving": True})
+        return items
 
     # ---- pinned zoom rail ---------------------------------------------- #
     def _draw_zoom_rail(self, frame, clean, items, W, H):
@@ -1166,6 +1259,8 @@ class TrackerApp:
             return
         H, W = frame.shape[:2]
         rows = [("toggle:dots", "Movement dots", self.toggles["dots"]),
+                ("toggle:boxes", "Object boxes", self.toggles["boxes"]),
+                ("toggle:zoom", "Zoom boxes", self.toggles["zoom"]),
                 ("mirror", "Mirror image", self.mirror),
                 ("fullscreen", "Fullscreen", self.fullscreen)]
         rh = lh(0.55)
