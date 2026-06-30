@@ -1410,9 +1410,10 @@ def main():
                    help="inference size. Default auto: 960 for cameras/files "
                         "(better at small/distant objects), 640 for the low-res "
                         "GoPro feed. Raise to 1280 for max range; lower for speed.")
-    p.add_argument("--conf", type=float, default=0.18,
+    p.add_argument("--conf", type=float, default=0.30,
                    help="initial confidence threshold (sets the Detection "
-                        "slider). Lower catches more (e.g. fast/blurry cars).")
+                        "slider). Lower catches more but risks false positives "
+                        "(tree->elephant); higher is stricter.")
     p.add_argument("--width", type=int, default=1920,
                    help="requested camera capture width (default 1920)")
     p.add_argument("--height", type=int, default=1080,
